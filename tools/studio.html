@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Emmy PTX studio</title>
+  <style>
+    :root {
+      --bg: #0a0c0f;
+      --bar: #0f1216;
+      --panel: #11151a;
+      --elev: #161b22;
+      --ink: #d8dee6;
+      --muted: #8b949e;
+      --faint: #5b6470;
+      --line: #222830;
+      --teal: #3dba9a;
+      --teal-dim: #16352c;
+      --amber: #c4a35a;
+      --amber-dim: #3a3018;
+      --red: #d36b73;
+      --code-bg: #0c0e12;
+      --gutter: #0a0c10;
+      --mono: "Cascadia Mono", "IBM Plex Mono", "Consolas", ui-monospace, monospace;
+      --sans: "Segoe UI", "IBM Plex Sans", system-ui, sans-serif;
+      --nav: 46px;
+      --rail: 48px;
+      --side: 248px;
+      --dock: 176px;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--ink);
+      font: 13px/1.4 var(--sans); color-scheme: dark;
+    }
+    .ed-body, .side, .dock-body {
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+    .ed-body::-webkit-scrollbar,
+    .side::-webkit-scrollbar,
+    .dock-body::-webkit-scrollbar { width: 0; height: 0; display: none; }
+    button, select { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
+    svg { fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+    .top {
+      height: var(--nav); display: flex; align-items: center; gap: 10px;
+      padding: 0 10px 0 0; border-bottom: 1px solid var(--line); background: var(--bar);
+    }
+    .brand {
+      width: calc(var(--rail) + var(--side)); flex: none; display: flex; align-items: center;
+      gap: 8px; padding: 0 14px; font-weight: 700; letter-spacing: .12em; font-size: 11px;
+      text-transform: uppercase; white-space: nowrap; border-right: 1px solid var(--line); height: 100%;
+    }
+    .brand em { color: var(--teal); font-style: normal; }
+    .crumb { color: var(--muted); font-size: 12px; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+    .crumb i { color: var(--faint); font-style: normal; }
+    .grow { flex: 1; }
+    .sel {
+      background: var(--elev); border: 1px solid var(--line); border-radius: 4px;
+      padding: 4px 8px; min-width: 168px; height: 28px;
+    }
+    .sel.arch { min-width: 88px; }
+    .btn {
+      border: 1px solid var(--line); background: var(--elev); border-radius: 4px;
+      padding: 4px 10px; height: 28px; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+    }
+    .btn svg { width: 13px; height: 13px; }
+    .btn:hover:not(:disabled) { border-color: #343c48; }
+    .btn-teal { background: var(--teal-dim); border-color: #2a6d58; color: var(--teal); }
+    .btn-amber { background: var(--amber-dim); border-color: #6a5428; color: var(--amber); }
+    .btn-ghost { background: transparent; color: var(--muted); padding: 4px 6px; }
+    .status { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .status .pip { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+    .status.ok .pip { background: var(--teal); } .status.ok { color: var(--teal); }
+    .status.busy .pip { background: var(--amber); } .status.busy { color: var(--amber); }
+    .status.err .pip { background: var(--red); } .status.err { color: var(--red); }
+
+    .app {
+      position: relative;
+      display: grid;
+      grid-template-columns: var(--rail) var(--side) 1fr;
+      grid-template-rows: 1fr var(--dock);
+      height: calc(100% - var(--nav));
+    }
+    .rail {
+      background: var(--bar); border-right: 1px solid var(--line);
+      display: flex; flex-direction: column; align-items: center; padding: 8px 0; gap: 2px;
+    }
+    .rail button {
+      width: 34px; height: 34px; border: 0; background: transparent; color: var(--faint);
+      border-radius: 6px; display: grid; place-items: center;
+    }
+    .rail button svg { width: 16px; height: 16px; }
+    .rail button:hover { color: var(--ink); background: var(--elev); }
+    .rail button.active { color: var(--teal); background: var(--teal-dim); }
+
+    .side { position: relative; background: var(--panel); border-right: 1px solid var(--line); overflow: auto; padding: 14px 14px 18px; }
+    .label { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--faint); margin: 0 0 8px; }
+    .label.sp { margin-top: 18px; }
+    .kernel-card { background: var(--elev); border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+    .kernel-card h3 { margin: 0; font-size: 13px; font-weight: 650; }
+    .kernel-card .sub { color: var(--muted); font-size: 11px; font-family: var(--mono); margin-top: 3px; word-break: break-all; }
+    .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 8px; margin-top: 12px; }
+    .stat b { display: block; font-variant-numeric: tabular-nums; font-size: 18px; font-weight: 650; letter-spacing: -.02em; }
+    .stat span { color: var(--muted); font-size: 11px; }
+    .pipe { display: flex; flex-direction: column; }
+    .pipe-step { display: grid; grid-template-columns: 16px 1fr; gap: 8px; padding: 7px 0; color: var(--muted); }
+    .pipe-step + .pipe-step { border-top: 1px solid transparent; }
+    .pipe-step .n {
+      width: 14px; height: 14px; margin-top: 1px; border: 1.5px solid var(--line); border-radius: 50%;
+      display: grid; place-items: center;
+    }
+    .pipe-step .n svg { width: 9px; height: 9px; display: none; }
+    .pipe-step.done { color: var(--ink); }
+    .pipe-step.done .n { background: var(--teal); border-color: var(--teal); color: #06241c; }
+    .pipe-step.done .n svg { display: block; stroke-width: 2.4; }
+    .pipe-step strong { font-weight: 600; font-size: 12px; }
+    .pipe-step .hint { color: var(--faint); font-size: 11px; margin-top: 1px; }
+    .klist { display: flex; flex-direction: column; gap: 2px; }
+    .klist button { width: 100%; text-align: left; background: transparent; border: 0; padding: 7px 8px; border-radius: 4px; color: var(--muted); }
+    .klist button:hover, .klist button.active { background: var(--elev); color: var(--ink); }
+    .klist small { display: block; color: var(--faint); font-size: 11px; font-family: var(--mono); }
+    .empty { color: var(--faint); font: 12px/1.5 var(--sans); }
+
+    .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+    .editors { display: grid; grid-template-columns: 1fr 1fr; flex: 1; min-height: 0; }
+    .ed { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--line); position: relative; }
+    .ed:last-child { border-right: 0; }
+    .ed-head {
+      height: 34px; display: flex; align-items: center; gap: 8px;
+      padding: 0 8px 0 12px; border-bottom: 1px solid var(--line); background: var(--bar); color: var(--muted); font-size: 12px;
+    }
+    .ed-head strong { color: var(--ink); font-weight: 600; }
+    .ed-meta { color: var(--faint); font-size: 11px; font-family: var(--mono); }
+    .ed-body {
+      flex: 1; min-height: 0; min-width: 0;
+      overflow-x: hidden; overflow-y: auto; background: var(--code-bg);
+    }
+    .ed-scroll { display: flex; align-items: flex-start; min-width: 100%; }
+    .gutter {
+      position: sticky; left: 0; z-index: 1;
+      flex: none; min-width: 42px; text-align: right; padding: 10px 8px 16px 0;
+      color: #4a5360; font: 12px/18.6px var(--mono); user-select: none;
+      border-right: 1px solid var(--line); background: var(--gutter);
+    }
+    .code {
+      flex: 1; min-width: 0; margin: 0; padding: 10px 14px 16px;
+      white-space: pre; font: 12px/18.6px var(--mono);
+    }
+    .code .line { min-height: 18.6px; }
+    .code .line:hover { background: #141922; }
+    .kw { color: #6ea8ff; } .fn { color: #d0a36c; } .num { color: #c3a06a; }
+    .reg { color: #7ec8c0; } .dir { color: #c58ae8; } .cmt { color: #5c6570; }
+    .str { color: #8fbf7a; } .pred { color: #d36b73; }
+    .busy-mask {
+      position: absolute; inset: 34px 0 0; display: none; align-items: center; justify-content: center;
+      background: rgba(10,12,15,.45); color: var(--muted); font-size: 12px; pointer-events: none;
+    }
+    .busy-mask.on { display: flex; }
+    .sb { position: absolute; z-index: 4; }
+    .sb.off { display: none; }
+    .sb i {
+      position: absolute; background: #4a5360; border-radius: 6px;
+      opacity: .55; transition: opacity .12s linear;
+    }
+    .ed:hover .sb i, .side:hover .sb i, .dock:hover .sb i, .sb.drag i { opacity: .95; }
+    .sb-v { top: 36px; right: 3px; bottom: 4px; width: 5px; }
+    .side > .sb-v { top: 8px; }
+    .dock > .sb-v { top: 32px; bottom: 28px; }
+    .sb-h { left: 44px; right: 8px; bottom: 3px; height: 5px; }
+    .sb-v i { left: 0; right: 0; }
+    .sb-h i { top: 0; bottom: 0; }
+
+    .dock { position: relative; grid-column: 1 / -1; border-top: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+    .dock-head { display: flex; align-items: center; gap: 2px; padding: 0 8px; height: 30px; border-bottom: 1px solid var(--line); }
+    .tab { background: transparent; border: 0; color: var(--muted); padding: 5px 10px; border-radius: 4px; font-size: 12px; }
+    .tab.active { color: var(--ink); background: var(--elev); }
+    .dock-body { flex: 1; overflow: auto; padding: 10px 12px; font: 12px/1.55 var(--mono); color: var(--muted); white-space: pre-wrap; }
+    .dock-foot {
+      display: flex; align-items: center; flex-wrap: wrap; gap: 10px 18px; padding: 5px 12px;
+      border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; background: var(--bar);
+    }
+    .dock-foot b { color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; }
+    .ok { color: var(--teal); } .bad { color: var(--red); }
+
+    @media (max-width: 960px) {
+      .brand { width: auto; border-right: 0; }
+      .app { grid-template-columns: var(--rail) 1fr; }
+      .side { display: none; }
+      .side.open {
+        display: block; position: absolute; left: var(--rail); top: 0; bottom: 0; z-index: 5;
+        width: var(--side); background: var(--panel); box-shadow: 8px 0 24px rgba(0,0,0,.45);
+      }
+    }
+    @media (max-width: 720px) {
+      .editors { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">Emmy <em>PTX</em> studio</div>
+    <div class="crumb" id="crumb">Compiler Lab <i>/</i> Kernel</div>
+    <select class="sel" id="problem" aria-label="Kernel"></select>
+    <button class="btn btn-teal" id="compile" type="button">
+      <svg viewBox="0 0 16 16"><path d="M6 3 2 8l4 5M10 3l4 5-4 5"/></svg>
+      Lower to PTX
+    </button>
+    <button class="btn btn-amber" id="run" type="button">
+      <svg viewBox="0 0 16 16"><path d="M4 3.5v9l9-4.5z"/></svg>
+      Run on RTX 5090
+    </button>
+    <span class="status" id="status"><i class="pip"></i><span id="status-text">Idle</span></span>
+    <div class="grow"></div>
+  </header>
+
+  <div class="app">
+    <nav class="rail" id="rail">
+      <button type="button" data-view="kernels" title="Kernels">
+        <svg viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5"/><rect x="9" y="2" width="5" height="5"/><rect x="2" y="9" width="5" height="5"/><rect x="9" y="9" width="5" height="5"/></svg>
+      </button>
+      <button type="button" data-view="compiler" title="Compiler" class="active">
+        <svg viewBox="0 0 16 16"><path d="M5 4 2 8l3 4M11 4l3 4-3 4M9 3 7 13"/></svg>
+      </button>
+      <button type="button" data-view="runs" title="Test Runs">
+        <svg viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h7"/></svg>
+      </button>
+      <button type="button" data-view="bench" title="Benchmarks">
+        <svg viewBox="0 0 16 16"><path d="M3 13V8M7 13V3M11 13V6M2 13h12"/></svg>
+      </button>
+      <button type="button" data-view="settings" title="Settings">
+        <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 2.5v1.6M8 11.9v1.6M2.5 8h1.6M11.9 8h1.6M4.1 4.1l1.1 1.1M10.8 10.8l1.1 1.1M11.9 4.1l-1.1 1.1M5.2 10.8l-1.1 1.1"/></svg>
+      </button>
+    </nav>
+
+    <aside class="side" id="side"></aside>
+
+    <div class="main">
+      <div class="editors">
+        <section class="ed">
+          <div class="ed-head">
+            <strong>Kernel IR</strong>
+            <span class="ed-meta" id="ir-meta"></span>
+            <div class="grow"></div>
+            <button class="btn btn-ghost" id="copy-ir" type="button" title="Copy IR">Copy</button>
+          </div>
+          <div class="ed-body" id="ir-scroll">
+            <div class="ed-scroll">
+              <div class="gutter" id="ir-gutter"></div>
+              <pre class="code" id="ir"></pre>
+            </div>
+          </div>
+          <div class="busy-mask" id="ir-busy">Lowering…</div>
+          <div class="sb sb-v off" data-pane="ir-scroll"><i></i></div>
+        </section>
+        <section class="ed">
+          <div class="ed-head">
+            <strong>Generated PTX</strong>
+            <span class="ed-meta" id="ptx-meta"></span>
+            <div class="grow"></div>
+            <select class="sel arch" id="arch" aria-label="Assemble architecture">
+              <option value="sm_89" selected>sm_89</option>
+              <option value="sm_86">sm_86</option>
+              <option value="sm_90">sm_90</option>
+            </select>
+            <button class="btn btn-ghost" id="copy-ptx" type="button" title="Copy PTX">Copy</button>
+            <button class="btn btn-ghost" id="dl-ptx" type="button" title="Download PTX">Save</button>
+          </div>
+          <div class="ed-body" id="ptx-scroll">
+            <div class="ed-scroll">
+              <div class="gutter" id="ptx-gutter"></div>
+              <pre class="code" id="ptx"></pre>
+            </div>
+          </div>
+          <div class="busy-mask" id="ptx-busy">Lowering…</div>
+          <div class="sb sb-v off" data-pane="ptx-scroll"><i></i></div>
+        </section>
+      </div>
+    </div>
+
+    <section class="dock">
+      <div class="dock-head">
+        <button type="button" class="tab active" data-dock="diag">Diagnostics</button>
+        <button type="button" class="tab" data-dock="regs">Registers</button>
+        <button type="button" class="tab" data-dock="perf">Performance</button>
+        <button type="button" class="tab" data-dock="out">Run Output</button>
+      </div>
+      <div class="dock-body" id="dock"></div>
+      <div class="dock-foot" id="foot"></div>
+      <div class="sb sb-v off" data-pane="dock"><i></i></div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const PIPE = [
+      ["Load Graph.from_dict", "IR JSON + sibling meta.json"],
+      ["ABI setup", "cvta.to.global, tid, cta, gid"],
+      ["Tile axis decode", "N-guard if extra threads"],
+      ["Walk IR", "FMA peephole, CSE, fusion, unroll"],
+      ["Emit PTX", "validate & optimize with ptxas"],
+    ];
+    const CAT = { p: "Pointwise", r: "Reduction", m: "Matmul", f: "Fused", a: "Attention" };
+    const CHECK = '<svg viewBox="0 0 12 12"><path d="M2.5 6.2 5 8.7 9.5 3.4"/></svg>';
+
+    const state = {
+      problems: [], bundle: null, error: null,
+      compiling: false, running: false,
+      view: "compiler", dock: "diag",
+      runs: [], host: null,
+    };
+
+    function esc(s) {
+      return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+    }
+    function setStatus(kind, text) {
+      $("status").className = "status " + (kind || "");
+      $("status-text").textContent = text;
+    }
+    function currentProblem() {
+      return state.problems.find((p) => p.id === $("problem").value) || null;
+    }
+    function category(id) { return CAT[(id || "")[0]] || "Kernel"; }
+
+    function highlightIr(line) {
+      let s = esc(line);
+      s = s.replace(/\b(Tile|Init|Smem|Sync|load|for|if)\b/g, '<span class="kw">$1</span>');
+      s = s.replace(/\b(f32|i32|int|float|bf16)\b/g, '<span class="dir">$1</span>');
+      s = s.replace(/\b(add|multiply|maximum|subtract|exp|reciprocal|divide)\b/g, '<span class="fn">$1</span>');
+      s = s.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="num">$1</span>');
+      return s;
+    }
+    function highlightPtx(line) {
+      const idx = line.indexOf("//");
+      const code = idx >= 0 ? line.slice(0, idx) : line;
+      const cmt = idx >= 0 ? line.slice(idx) : "";
+      let s = esc(code);
+      s = s.replace(/^(\s*\.[A-Za-z][\w.]*)/, '<span class="dir">$1</span>');
+      s = s.replace(/(@%[a-zA-Z]\d+)/g, '<span class="pred">$1</span>');
+      s = s.replace(/(%[a-zA-Z]+\d+)/g, '<span class="reg">$1</span>');
+      s = s.replace(/\b(0f[0-9A-Fa-f]+|\d+)\b/g, '<span class="num">$1</span>');
+      s = s.replace(/(^|<\/span>\s+)([a-z][\w.]*)/, '$1<span class="fn">$2</span>');
+      return s + (cmt ? '<span class="cmt">' + esc(cmt) + "</span>" : "");
+    }
+
+    function renderEditor(gutterId, codeId, text, hi, emptyMsg) {
+      const g = $(gutterId), c = $(codeId);
+      if (!text) {
+        g.innerHTML = "";
+        c.innerHTML = '<div class="empty" style="padding:20px 4px">' + esc(emptyMsg) + "</div>";
+        return;
+      }
+      const lines = text.replace(/\n$/, "").split("\n");
+      g.innerHTML = lines.map((_, i) => "<div>" + (i + 1) + "</div>").join("");
+      c.innerHTML = lines.map((ln) => '<div class="line">' + hi(ln) + "</div>").join("");
+    }
+
+    function dash(v) { return v == null ? "—" : v; }
+
+    function renderSide() {
+      const p = currentProblem();
+      const b = state.bundle;
+      const s = (b && b.stats) || {};
+      const regs = b && b.ptxas && b.ptxas.registers;
+      const host = state.host || {};
+
+      if (state.view === "kernels") {
+        $("side").innerHTML =
+          '<div class="label">Kernels</div><div class="klist">' +
+          state.problems.map((k) =>
+            '<button type="button" data-kid="' + esc(k.id) + '" class="' + (p && p.id === k.id ? "active" : "") + '">' +
+            esc(k.id) + "<small>" + esc(k.entry || "") + "</small></button>"
+          ).join("") + "</div>";
+        $("side").querySelectorAll("[data-kid]").forEach((btn) => {
+          btn.onclick = () => { $("problem").value = btn.dataset.kid; onKernelChange(); };
+        });
+        return;
+      }
+      if (state.view === "runs") {
+        $("side").innerHTML = state.runs.length
+          ? '<div class="label">Test runs</div><div class="klist">' +
+            state.runs.map((r, i) => '<button type="button" data-run="' + i + '">' + esc(r.id) +
+              "<small>" + (r.pass ? "PASS" : "see output") + " · " + esc(r.at) + "</small></button>").join("") + "</div>"
+          : '<div class="label">Test runs</div><p class="empty">No GPU runs in this session. Use Run on RTX 5090.</p>';
+        $("side").querySelectorAll("[data-run]").forEach((btn) => {
+          btn.onclick = () => { state.dock = "out"; renderDock(); };
+        });
+        return;
+      }
+      if (state.view === "bench") {
+        const rows = state.runs.filter((r) => r.pass && r.us != null);
+        $("side").innerHTML = '<div class="label">Benchmarks</div>' + (rows.length
+          ? rows.map((r) => '<div class="stat" style="margin-bottom:10px"><b>' + r.us.toFixed(2) + " µs</b><span>" + esc(r.id) + "</span></div>").join("")
+          : '<p class="empty">No timed PASS results yet. Times come from the hosted runner.</p>');
+        return;
+      }
+      if (state.view === "settings") {
+        $("side").innerHTML =
+          '<div class="label">Settings</div>' +
+          '<div class="kernel-card">' +
+          '<div class="sub">PTX .target ' + esc(host.ptx_target || "sm_89") + " / .version " + esc(host.ptx_version || "8.0") + "</div>" +
+          '<div class="sub" style="margin-top:8px">ptxas<br>' + esc(host.ptxas || "—") + "</div>" +
+          '<div class="sub" style="margin-top:8px">CUDA_PATH<br>' + esc(host.cuda_path || "(unset)") + "</div>" +
+          '<div class="sub" style="margin-top:8px">Runner<br>' + esc(host.runner || "") + "</div>" +
+          '<div class="sub" style="margin-top:8px">Contract<br>' + esc(host.contract || "") + "</div></div>" +
+          '<p class="empty" style="margin-top:10px">The architecture dropdown only changes the ptxas assemble check. Emitted PTX stays .target sm_89.</p>';
+        return;
+      }
+
+      const entry = (b && b.entry) || (p && p.entry) || "—";
+      const done = !!(b && !state.error);
+      $("side").innerHTML =
+        '<div class="label">Selected kernel</div>' +
+        '<div class="kernel-card"><h3>' + esc(p ? p.id : "—") + "</h3>" +
+        '<div class="sub">' + esc(entry) + "</div>" +
+        '<div class="stats">' +
+          '<div class="stat"><b>' + dash(regs) + "</b><span>ptxas regs</span></div>" +
+          '<div class="stat"><b>' + dash(b ? b.smem_bytes : null) + "</b><span>smem B</span></div>" +
+          '<div class="stat"><b>' + dash(s.unrolled_iters) + "</b><span>unroll iters</span></div>" +
+          '<div class="stat"><b>' + dash(s.vec_loads) + "</b><span>vec ld</span></div>" +
+        "</div></div>" +
+        '<div class="label sp">Compiler pipeline</div><div class="pipe">' +
+        PIPE.map((st) => '<div class="pipe-step' + (done ? " done" : "") +
+          '"><i class="n">' + CHECK + '</i><div><strong>' + st[0] + '</strong><div class="hint">' + st[1] + "</div></div></div>").join("") +
+        "</div>";
+    }
+
+    function renderDock() {
+      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.dock === state.dock));
+      const b = state.bundle;
+      const box = $("dock");
+      if (state.dock === "out") {
+        if (!state.runs.length) { box.textContent = "No runner output yet."; return; }
+        const last = state.runs[state.runs.length - 1];
+        box.innerHTML = '<span class="' + (last.pass ? "ok" : "bad") + '">' + esc(last.id) + "</span>\n" + esc(last.text);
+        return;
+      }
+      if (!b && !state.error) { box.textContent = "Lower a kernel to populate diagnostics."; return; }
+      if (state.error && !b) { box.innerHTML = '<span class="bad">' + esc(state.error) + "</span>"; return; }
+      const px = (b && b.ptxas) || {};
+      if (state.dock === "diag") {
+        const errs = px.errors || [];
+        const warns = px.warnings || [];
+        const head = px.ok
+          ? '<span class="ok">ptxas ' + esc(px.arch || "sm_89") + " OK</span>"
+          : '<span class="bad">ptxas failed</span>';
+        const time = b && b.elapsed_ms != null ? "Compiled in " + b.elapsed_ms + " ms" : "";
+        box.innerHTML = [head, time, errs.length ? errs.map(esc).join("\n") : "No errors.",
+          warns.length ? warns.map(esc).join("\n") : "No warnings.",
+          px.log || ""].filter(Boolean).join("\n");
+        return;
+      }
+      if (state.dock === "regs") {
+        const v = (b && b.virt_regs) || {};
+        box.textContent = "ptxas allocated: " + dash(px.registers) + " registers\n" +
+          "virtual .pred " + dash(v.pred) + "  .f32 " + dash(v.f32) + "  .b32 " + dash(v.b32) + "  .b64 " + dash(v.b64);
+        return;
+      }
+      const mix = Object.entries((b && b.ops) || {}).sort((a, c) => c[1] - a[1]).slice(0, 12);
+      const s = (b && b.stats) || {};
+      box.textContent = "FMA " + dash(s.fma) + " · CSE hits " + dash(s.cse_hits) + " · fused loops " + dash(s.fused_loops) +
+        " · cp.async " + dash(s.cp_async) + " · shfl " + dash(s.warp_shuffles) +
+        (mix.length ? "\n" + mix.map(([k, n]) => k + "×" + n).join("  ") : "");
+    }
+
+    function renderFoot() {
+      const b = state.bundle;
+      const s = (b && b.stats) || {};
+      const regs = b && b.ptxas && b.ptxas.registers;
+      const arch = (b && b.ptxas && b.ptxas.arch) || $("arch").value;
+      $("foot").innerHTML =
+        "<span><b>" + dash(regs) + "</b> Registers</span>" +
+        "<span><b>" + (b ? b.smem_bytes : "—") + "</b> B Shared Memory</span>" +
+        "<span><b>" + dash(s.unrolled_iters) + "</b> Unroll Iters</span>" +
+        "<span><b>" + dash(s.vec_loads) + "</b> Vec ld</span>" +
+        "<span><b>" + dash(s.warp_shuffles) + "</b> Shfl</span>" +
+        "<span>Target " + esc(arch) + (b && b.entry ? " · " + esc(b.entry) : "") + "</span>";
+    }
+
+    function irHeader(text) {
+      if (!text) return "";
+      const n = text.match(/\(N=(\d+)\)/);
+      const dt = text.match(/\b(f32|bf16|f16)\b/);
+      const parts = [];
+      if (n) parts.push("N = " + n[1]);
+      if (dt) parts.push("dtype = " + dt[1]);
+      return parts.join("  ·  ");
+    }
+
+    function bindScroll(id, axes) {
+      const box = $(id);
+      const host = box.closest(".ed") || box.closest(".dock") || box.closest(".side");
+      const v = host.querySelector('.sb-v[data-pane="' + id + '"]');
+      const h = host.querySelector('.sb-h[data-pane="' + id + '"]');
+      const vt = v && v.querySelector("i");
+      const ht = h && h.querySelector("i");
+      function sync() {
+        const cw = box.clientWidth, ch = box.clientHeight;
+        const sw = box.scrollWidth, sh = box.scrollHeight;
+        if (v && axes.indexOf("v") >= 0) {
+          const need = sh > ch + 2;
+          v.classList.toggle("off", !need);
+          if (need) {
+            const track = v.clientHeight;
+            const size = Math.max(24, track * ch / sh);
+            vt.style.height = size + "px";
+            vt.style.top = ((track - size) * box.scrollTop / Math.max(1, sh - ch)) + "px";
+          }
+        }
+        if (h && axes.indexOf("h") >= 0) {
+          const need = sw > cw + 16;
+          h.classList.toggle("off", !need);
+          if (need) {
+            const track = h.clientWidth;
+            const size = Math.max(24, track * cw / sw);
+            ht.style.width = size + "px";
+            ht.style.left = ((track - size) * box.scrollLeft / Math.max(1, sw - cw)) + "px";
+          }
+        }
+      }
+      function drag(bar, thumb, axis) {
+        if (!bar) return;
+        bar.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          bar.classList.add("drag");
+          const start = axis === "v" ? e.clientY : e.clientX;
+          const origin = axis === "v" ? box.scrollTop : box.scrollLeft;
+          const move = (ev) => {
+            const d = (axis === "v" ? ev.clientY : ev.clientX) - start;
+            const track = axis === "v" ? bar.clientHeight : bar.clientWidth;
+            const ts = axis === "v" ? thumb.offsetHeight : thumb.offsetWidth;
+            const range = axis === "v" ? box.scrollHeight - box.clientHeight : box.scrollWidth - box.clientWidth;
+            const next = origin + d / Math.max(1, track - ts) * range;
+            if (axis === "v") box.scrollTop = next; else box.scrollLeft = next;
+          };
+          const up = () => {
+            bar.classList.remove("drag");
+            window.removeEventListener("mousemove", move);
+            window.removeEventListener("mouseup", up);
+          };
+          window.addEventListener("mousemove", move);
+          window.addEventListener("mouseup", up);
+        });
+      }
+      box.addEventListener("scroll", sync, { passive: true });
+      new ResizeObserver(sync).observe(box);
+      drag(v, vt, "v");
+      drag(h, ht, "h");
+      return sync;
+    }
+
+    function renderEditors() {
+      const b = state.bundle;
+      const p = currentProblem();
+      $("ir-meta").textContent = irHeader(b && b.ir_txt);
+      $("ptx-meta").textContent = b && b.ptxas && b.ptxas.ok === false ? "assemble failed" : "";
+      renderEditor("ir-gutter", "ir", b && b.ir_txt, highlightIr, "Lower a kernel to load its Kernel IR.");
+      renderEditor("ptx-gutter", "ptx", b && b.ptx, highlightPtx, "Generated PTX appears here after a successful lower.");
+      $("crumb").innerHTML = "Compiler Lab <i>/</i> " + esc(p ? category(p.id) : "—");
+      requestAnimationFrame(() => { syncIr(); syncPtx(); });
+    }
+
+    function renderAll() {
+      document.querySelectorAll("#rail button").forEach((b) => b.classList.toggle("active", b.dataset.view === state.view));
+      const busy = state.compiling;
+      $("ir-busy").classList.toggle("on", busy);
+      $("ptx-busy").classList.toggle("on", busy);
+      renderSide();
+      renderEditors();
+      renderDock();
+      renderFoot();
+      requestAnimationFrame(() => { syncIr(); syncPtx(); syncDock(); $("side").scrollTop = 0; });
+    }
+
+    async function compile() {
+      const id = $("problem").value;
+      if (!id) return;
+      state.compiling = true;
+      state.error = null;
+      $("compile").disabled = true;
+      setStatus("busy", "Lowering…");
+      $("ir-busy").classList.add("on");
+      $("ptx-busy").classList.add("on");
+      try {
+        const r = await fetch("/api/compile?id=" + encodeURIComponent(id) + "&arch=" + encodeURIComponent($("arch").value));
+        const j = await r.json();
+        if (!r.ok || j.error) {
+          state.bundle = j.ptx ? j : null;
+          state.error = j.error || "compile failed";
+          setStatus("err", "Error");
+        } else {
+          state.bundle = j;
+          setStatus(j.ptxas && j.ptxas.ok ? "ok" : "err", j.ptxas && j.ptxas.ok ? "Ready" : "ptxas");
+        }
+      } catch (e) {
+        state.bundle = null;
+        state.error = String(e);
+        setStatus("err", "Error");
+      }
+      state.compiling = false;
+      $("compile").disabled = false;
+      if (state.dock === "out" && state.error) state.dock = "diag";
+      renderAll();
+    }
+
+    async function runGpu() {
+      const id = $("problem").value;
+      if (!id) return;
+      state.running = true;
+      $("run").disabled = true;
+      setStatus("busy", "Runner…");
+      state.dock = "out";
+      renderDock();
+      try {
+        const r = await fetch("/api/submit?id=" + encodeURIComponent(id), { method: "POST" });
+        const j = await r.json();
+        const text = ((j.stdout || "") + (j.stderr || "") + (j.error || "")).trim() || JSON.stringify(j);
+        const pass = j.code === 0 && /PASS/.test(text);
+        const m = text.match(/\(([0-9.]+)\s+us\)/);
+        state.runs.push({
+          id, text, pass, code: j.code, at: new Date().toLocaleTimeString(),
+          us: m ? parseFloat(m[1]) : null,
+        });
+        setStatus(pass ? "ok" : "err", pass ? "PASS" : "Check output");
+      } catch (e) {
+        state.runs.push({ id, text: String(e), pass: false, code: -1, at: new Date().toLocaleTimeString(), us: null });
+        setStatus("err", "Error");
+      }
+      state.running = false;
+      $("run").disabled = false;
+      renderAll();
+    }
+
+    function onKernelChange() {
+      state.bundle = null;
+      state.error = null;
+      setStatus("", "Idle");
+      renderAll();
+      compile();
+    }
+
+    function copyText(text, label) {
+      if (!text) { setStatus("err", "Nothing to copy"); return; }
+      navigator.clipboard.writeText(text).then(() => setStatus("ok", "Copied " + label)).catch(() => setStatus("err", "Copy failed"));
+    }
+    function downloadPtx() {
+      const b = state.bundle;
+      if (!b || !b.ptx) { setStatus("err", "No PTX"); return; }
+      const blob = new Blob([b.ptx], { type: "text/plain" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = (b.entry || "kernel") + ".ptx";
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+
+    $("compile").onclick = compile;
+    $("run").onclick = runGpu;
+    $("copy-ir").onclick = () => copyText(state.bundle && state.bundle.ir_txt, "IR");
+    $("copy-ptx").onclick = () => copyText(state.bundle && state.bundle.ptx, "PTX");
+    $("dl-ptx").onclick = downloadPtx;
+    $("problem").onchange = onKernelChange;
+    $("arch").onchange = () => { if ($("problem").value) compile(); };
+    document.querySelectorAll("#rail button").forEach((btn) => {
+      btn.onclick = () => {
+        state.view = btn.dataset.view;
+        $("side").classList.add("open");
+        renderAll();
+      };
+    });
+    document.querySelectorAll(".tab").forEach((btn) => {
+      btn.onclick = () => { state.dock = btn.dataset.dock; renderDock(); requestAnimationFrame(syncDock); };
+    });
+    const syncIr = bindScroll("ir-scroll", "v");
+    const syncPtx = bindScroll("ptx-scroll", "v");
+    const syncDock = bindScroll("dock", "v");
+
+    async function boot() {
+      try {
+        const [pr, st] = await Promise.all([fetch("/api/problems"), fetch("/api/status")]);
+        const pj = await pr.json();
+        state.problems = pj.problems || [];
+        state.host = await st.json();
+        $("problem").innerHTML = state.problems.map((p) =>
+          '<option value="' + esc(p.id) + '">' + esc(p.id) + "</option>").join("");
+        renderAll();
+        if (state.problems.length) compile();
+        else setStatus("err", "No problems/");
+      } catch (e) {
+        state.error = String(e);
+        setStatus("err", "API error");
+        renderAll();
+      }
+    }
+    boot();
+  </script>
+</body>
+</html>

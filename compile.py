@@ -1,23 +1,33 @@
 #!/usr/bin/env python3
-"""Kernel IR -> PTX compiler.
+"""Kernel IR -> PTX printer.
 
 Contract:  python compile.py path/to/kernel.ir.json > out.ptx
 
-Pipeline (every kernel, no per-problem special cases):
+This is the last stage of an ML compiler, not the whole compiler.
+Emmy already chose the schedule (tiles, cp.async, tree reduce). We only
+print that schedule as PTX. No problem-id table, no shape switch.
 
-  1. Load the IR with Graph.from_dict. The entry name is KernelOp.name.
-  2. ABI comes from sibling meta.json arg_order (not the node's inputs list).
-  3. Prologue: param loads, cvta.to.global, tid/cta/gid, optional Tile N-guard
-     when the launch has more threads than cells (or aux_threads).
-  4. Walk statements in order. Map SSA names to virtual PTX registers.
-     ptxas allocates the physical registers.
-  5. Local peepholes that do not change results: FMA (mul+add / mul+accum),
-     CSE of index expressions, consecutive-loop fusion on the same axis,
-     IR-flagged or straight-line unroll bounded by UNROLL_EXPANSION_CAP,
-     pairing consecutive f32 loads into ld.v2/v4, address [ptr+imm].
+How to read this file (top to bottom):
 
-Shared memory larger than the 48 KB static cap is emitted as
-`.extern .shared` so launch smem_bytes from meta.json can size it.
+  helpers     dtype / walk / meta ABI
+  Emitter     virtual registers (%f, %r, %rd, %p). ptxas allocates for real.
+  Compiler    one KernelOp -> one .entry
+    prologue  params, cvta, 3-D tid/cta, lane/warp
+    stmt()    dispatch table for every IR node
+    emit_*    one function per node, named like the IR
+    extra ISA TMA / mbarrier / mma.sync / wgmma  (TASK.md * nodes)
+  compile_ir  the argv[1] entry point
+
+Pipeline:
+
+  1. Graph.from_dict. Entry name = KernelOp.name.
+  2. Parameter order from sibling meta.json arg_order.
+  3. Prologue, then Tile N-guard if the launch has extra threads.
+  4. Walk body in order. SSA name -> virtual register.
+  5. Local peepholes only: FMA, CSE, same-axis loop fusion,
+     bounded unroll, ld.v2/v4 pairing, [ptr+imm].
+
+Smem above 48 KB is `.extern .shared` so meta.smem_bytes sizes it at launch.
 """
 
 from __future__ import annotations
@@ -323,6 +333,7 @@ def identity_of(op) -> float:
     return table.get(name, 0.0)
 
 
+# Virtual registers. PTX has no physical file here — ptxas does that later.
 class Emitter:
     def __init__(self) -> None:
         self.lines: list[str] = []
@@ -390,6 +401,7 @@ class Emitter:
         return r
 
 
+# One KernelOp in, one .visible .entry out.
 class Compiler:
     def __init__(self, kop: KernelOp, shapes: dict, dtypes: dict, args: list[str], meta: dict | None = None):
         self.kop = kop
@@ -407,6 +419,9 @@ class Compiler:
         self.cse: dict[str, tuple[str, str]] = {}
         self.mem: dict[str, tuple[str, ...]] = {}
         self.e.on_bind = self.invalidate
+        # Threads with gid >= Tile.N. None = every lane is in-range.
+        # Never branch those lanes around bar.sync / TreeHalve / cp.async.wait.
+        self.active: str | None = None
         self.stats: dict[str, int] = {
             "fma": 0,
             "vec_loads": 0,
@@ -719,7 +734,11 @@ class Compiler:
         addr = self.addr_of(s.input, s.index, space)
         regs = [self.e.new_f() for _ in chain]
         packed = ", ".join(regs)
-        self.e.emit(f"        ld.{space}.v{vec}.f32 {{{packed}}}, [{addr}];")
+        if space == "global" and self.active:
+            z = self.e.imm_f32(0.0)
+            for r in regs:
+                self.e.emit(f"        mov.f32         {r}, {z};")
+        self.e.emit(f"{self._at(space)}ld.{space}.v{vec}.f32 {{{packed}}}, [{addr}];")
         for load, reg in zip(chain, regs):
             name = list(load.names)[0]
             self.e.bind(name, reg, "f32")
@@ -831,6 +850,7 @@ class Compiler:
         return False
 
     def stmt(self, s) -> None:
+        # One IR node kind -> one emit_*. Unknown kinds exit 2 (never silent).
         if isinstance(s, Tile):
             self.emit_tile(s)
         elif isinstance(s, Smem):
@@ -934,7 +954,21 @@ class Compiler:
         guard = aux != 0 or not cells or n % int(cells) != 0
         skip = None
         saved = None
-        if guard:
+        prev_active = self.active
+        # Collective ops need every non-exited thread. A bra-skip around
+        # bar.sync is a Volta+ deadlock. Predicate global ld/st instead.
+        collective = any(
+            isinstance(s, (Sync, TreeHalve, WarpShuffle, CpAsyncCopy, CpAsyncCommit, CpAsyncWait,
+                           MbarrierInit, MbarrierArrive, MbarrierArriveExpectTx, MbarrierWait,
+                           TmaLoad, SetMaxNReg, WgmmaFence, WgmmaCommit, WgmmaWait,
+                           LdmatrixLoad, MmaSyncPtx))
+            for s in walk_stmts(tile.body)
+        )
+        if guard and collective:
+            p = e.new_p()
+            e.emit(f"        setp.lt.s32     {p}, {gid}, {n};")
+            self.active = p
+        elif guard:
             skip = e.label("SKIP")
             p = e.new_p()
             e.emit(f"        setp.ge.s32     {p}, {gid}, {n};")
@@ -1001,6 +1035,7 @@ class Compiler:
             else:
                 e.bind(axis.name, self.rem_imm(term, ext), "s32")
         self.stmts(tile.body)
+        self.active = prev_active
         if skip:
             e.emit(f"{skip}:")
             if saved is not None:
@@ -1243,6 +1278,11 @@ class Compiler:
         else:
             self.e.bind(s.name, self.expr_s32(s.value), "s32")
 
+    def _at(self, space: str) -> str:
+        if space == "global" and self.active:
+            return f"        @{self.active} "
+        return "        "
+
     def emit_load(self, s: Load) -> None:
         dt = dtype_name(s.dtype) or self.dtypes.get(s.input, "f32")
         pty = ptx_type(dt)
@@ -1261,7 +1301,11 @@ class Compiler:
             addr = self.addr_of(s.input, s.index, space)
             regs = [self.e.new_f() for _ in names]
             packed = ", ".join(regs)
-            self.e.emit(f"        ld.{space}.v{vec}.{pty} {{{packed}}}, [{addr}];")
+            if space == "global" and self.active:
+                z = self.e.imm_f32(0.0)
+                for r in regs:
+                    self.e.emit(f"        mov.f32         {r}, {z};")
+            self.e.emit(f"{self._at(space)}ld.{space}.v{vec}.{pty} {{{packed}}}, [{addr}];")
             for name, reg in zip(names, regs):
                 self.e.bind(name, reg, "f32")
             self.mem[mem_key] = tuple(regs)
@@ -1276,32 +1320,34 @@ class Compiler:
             addr = self.addr_of(s.input, idx, space)
             if dt in ("f32", "float", "float32"):
                 reg = self.e.new_f()
-                self.e.emit(f"        ld.{space}.{pty}   {reg}, [{addr}];")
+                if space == "global" and self.active:
+                    self.e.emit(f"        mov.f32         {reg}, {self.e.imm_f32(0.0)};")
+                self.e.emit(f"{self._at(space)}ld.{space}.{pty}   {reg}, [{addr}];")
                 self.e.bind(name, reg, "f32")
                 regs_out.append(reg)
             elif dt in ("f16", "half"):
                 tmp = self.e.new_r()
                 dest = self.e.new_f()
-                self.e.emit(f"        ld.{space}.f16    {tmp}, [{addr}];")
+                self.e.emit(f"{self._at(space)}ld.{space}.f16    {tmp}, [{addr}];")
                 self.e.emit(f"        cvt.f32.f16      {dest}, {tmp};")
                 self.e.bind(name, dest, "f32")
                 regs_out.append(dest)
             elif dt in ("bf16",):
                 tmp = self.e.new_r()
                 dest = self.e.new_f()
-                self.e.emit(f"        ld.{space}.bf16   {tmp}, [{addr}];")
+                self.e.emit(f"{self._at(space)}ld.{space}.bf16   {tmp}, [{addr}];")
                 self.e.emit(f"        cvt.f32.bf16     {dest}, {tmp};")
                 self.e.bind(name, dest, "f32")
                 regs_out.append(dest)
             elif dt in ("f64", "double"):
                 dest = self.e.new_d()
-                self.e.emit(f"        ld.{space}.f64    {dest}, [{addr}];")
+                self.e.emit(f"{self._at(space)}ld.{space}.f64    {dest}, [{addr}];")
                 self.e.bind(name, dest, "f64")
                 regs_out.append(dest)
             else:
                 kind = "s32"
                 reg = self.e.new_r()
-                self.e.emit(f"        ld.{space}.{pty}   {reg}, [{addr}];")
+                self.e.emit(f"{self._at(space)}ld.{space}.{pty}   {reg}, [{addr}];")
                 self.e.bind(name, reg, "s32")
                 regs_out.append(reg)
         self.mem[mem_key] = tuple(regs_out)
@@ -1316,14 +1362,14 @@ class Compiler:
         if s.atomic:
             addr = self.addr_of(s.output, s.index, space)
             src = self.as_f32(vals[0])
-            self.e.emit(f"        red.{space}.add.f32 [{addr}], {src};")
+            self.e.emit(f"{self._at(space)}red.{space}.add.f32 [{addr}], {src};")
             return
         vec = n if n in (2, 4) and dt in ("f32", "float", "float32") and not s.atomic else 1
         if vec > 1:
             addr = self.addr_of(s.output, s.index, space)
             regs = [self.as_f32(v) for v in vals]
             packed = ", ".join(regs)
-            self.e.emit(f"        st.{space}.v{vec}.{pty} [{addr}], {{{packed}}};")
+            self.e.emit(f"{self._at(space)}st.{space}.v{vec}.{pty} [{addr}], {{{packed}}};")
             return
         for k, name in enumerate(vals):
             idx = s.index
@@ -1332,19 +1378,19 @@ class Compiler:
                 idx = tuple(s.index[:-1]) + (last,)
             addr = self.addr_of(s.output, idx, space)
             if dt in ("f32", "float", "float32"):
-                self.e.emit(f"        st.{space}.{pty}   [{addr}], {self.as_f32(name)};")
+                self.e.emit(f"{self._at(space)}st.{space}.{pty}   [{addr}], {self.as_f32(name)};")
             elif dt in ("f16", "half"):
                 bits = self.e.new_r()
                 self.e.emit(f"        cvt.rn.f16.f32   {bits}, {self.as_f32(name)};")
-                self.e.emit(f"        st.{space}.f16   [{addr}], {bits};")
+                self.e.emit(f"{self._at(space)}st.{space}.f16   [{addr}], {bits};")
             elif dt in ("bf16",):
                 bits = self.e.new_r()
                 self.e.emit(f"        cvt.rn.bf16.f32  {bits}, {self.as_f32(name)};")
-                self.e.emit(f"        st.{space}.bf16  [{addr}], {bits};")
+                self.e.emit(f"{self._at(space)}st.{space}.bf16  [{addr}], {bits};")
             elif dt in ("f64", "double"):
-                self.e.emit(f"        st.{space}.f64   [{addr}], {self.as_f64(name)};")
+                self.e.emit(f"{self._at(space)}st.{space}.f64   [{addr}], {self.as_f64(name)};")
             else:
-                self.e.emit(f"        st.{space}.{pty}   [{addr}], {self.as_s32(name)};")
+                self.e.emit(f"{self._at(space)}st.{space}.{pty}   [{addr}], {self.as_s32(name)};")
 
     def emit_assign(self, s: Assign) -> None:
         op = s.op.name if hasattr(s.op, "name") else str(s.op)
@@ -1595,7 +1641,8 @@ class Compiler:
             e.emit(f"        mad.lo.s32      {dst}, {smem_idx}, {smem_nb}, {self.smem_base[s.smem]};")
         n = int(s.nbytes)
         q = "cg" if n == 16 else "ca"
-        e.emit(f"        cp.async.{q}.shared.global [{dst}], [{src}], {n};")
+        pred = f"@{self.active} " if self.active else ""
+        e.emit(f"        {pred}cp.async.{q}.shared.global [{dst}], [{src}], {n};")
         self._kill_mem(s.smem)
 
     def _divmod_recompose(self, q, r, dim: int):
@@ -1978,16 +2025,25 @@ class Compiler:
 
     def emit_select(self, s: Select) -> None:
         dest = self.e.new_f()
+        taken = self.e.new_p()
+        z32 = self.e.imm_s32(0)
+        self.e.emit(f"        setp.eq.s32     {taken}, {z32}, 1;")
         first = True
         for br in s.branches:
             p = self.expr_pred(br.select)
             val = self.as_f32(br.value)
+            use = self.e.new_p()
+            self.e.emit(f"        not.pred        {use}, {taken};")
+            self.e.emit(f"        and.pred        {use}, {use}, {p};")
             if first:
                 z = self.e.imm_f32(0.0)
-                self.e.emit(f"        selp.f32        {dest}, {val}, {z}, {p};")
+                self.e.emit(f"        selp.f32        {dest}, {val}, {z}, {use};")
                 first = False
             else:
-                self.e.emit(f"        selp.f32        {dest}, {val}, {dest}, {p};")
+                self.e.emit(f"        selp.f32        {dest}, {val}, {dest}, {use};")
+            nxt = self.e.new_p()
+            self.e.emit(f"        or.pred         {nxt}, {taken}, {p};")
+            taken = nxt
         self.e.bind(s.name, dest, "f32")
 
     def _mbar_addr(self, name: str, slot) -> str:

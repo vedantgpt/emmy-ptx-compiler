@@ -42,15 +42,37 @@ from emmy.compiler.ir.expr import (
     Var,
 )
 from emmy.compiler.ir.kernel.ir import (
+    BlockScaleLoad,
     CpAsyncCommit,
     CpAsyncCopy,
     CpAsyncWait,
+    FragmentApply,
+    FragmentPromote,
+    FragmentRepack,
+    FragmentRowReduce,
     KernelOp,
+    LdmatrixLoad,
+    MbarrierArrive,
+    MbarrierArriveExpectTx,
+    MbarrierInit,
+    MbarrierWait,
+    MmaSyncPtx,
+    RegFragment,
+    RegStore,
+    Select,
+    SetMaxNReg,
     Smem,
     Sync,
     Tile,
+    TmaDescriptor,
+    TmaLoad,
     TreeHalve,
     WarpShuffle,
+    WgmmaCommit,
+    WgmmaDescriptor,
+    WgmmaFence,
+    WgmmaMma,
+    WgmmaWait,
 )
 from emmy.compiler.ir.stmt import (
     Accum,
@@ -86,6 +108,7 @@ DTYPE_NBYTES = {
 PTX_LDST = {
     "f32": "f32", "float": "f32", "float32": "f32",
     "f16": "f16", "half": "f16",
+    "bf16": "bf16",
     "f64": "f64",
     "i32": "s32", "int": "s32", "int32": "s32", "s32": "s32",
     "i64": "s64",
@@ -304,6 +327,7 @@ class Emitter:
     def __init__(self) -> None:
         self.lines: list[str] = []
         self.nf = 1
+        self.nd = 1
         self.nr = 1
         self.nrd = 1
         self.np = 1
@@ -318,6 +342,11 @@ class Emitter:
     def new_f(self) -> str:
         r = f"%f{self.nf}"
         self.nf += 1
+        return r
+
+    def new_d(self) -> str:
+        r = f"%fd{self.nd}"
+        self.nd += 1
         return r
 
     def new_r(self) -> str:
@@ -387,7 +416,15 @@ class Compiler:
             "cp_async": 0,
             "warp_shuffles": 0,
             "tree_halves": 0,
+            "mma": 0,
+            "ldmatrix": 0,
+            "tma": 0,
+            "mbarrier": 0,
+            "wgmma": 0,
         }
+        self.frags: dict[str, dict] = {}
+        self.tma_descs: set[str] = set()
+        self.ptx_target = PTX_TARGET
 
     @staticmethod
     def _pack_smem(smems: list[Smem]) -> tuple[dict[str, int], int]:
@@ -410,8 +447,9 @@ class Compiler:
         smems = collect_smem(self.kop.body)
         self.smem_offsets, self.smem_total = self._pack_smem(smems)
         self.use_dynamic_smem = self.smem_total > SMEM_STATIC_LIMIT
+        self.ptx_target = "sm_90" if self._uses_sm90() else PTX_TARGET
         e.emit(f".version {PTX_VERSION}")
-        e.emit(f".target {PTX_TARGET}")
+        e.emit(f".target {self.ptx_target}")
         e.emit(".address_size 64")
         e.emit("")
         if self.use_dynamic_smem and smems:
@@ -427,13 +465,18 @@ class Compiler:
                 e.emit(f".shared .align {align} .b8 {sm.name}[{total * nb}];")
             if smems:
                 e.emit("")
-        params = ",\n".join(f"        .param .u64 param_{name}" for name in self.args)
+        param_names = list(self.args)
+        for name in self._tma_desc_names():
+            if name not in param_names:
+                param_names.append(name)
+            self.tma_descs.add(name)
+        params = ",\n".join(f"        .param .u64 param_{name}" for name in param_names)
         e.emit(f".visible .entry {self.kop.name}(")
         e.emit(params)
         e.emit(")")
-        bt = self._launch_block()
-        if bt:
-            e.emit(f".reqntid {bt}")
+        req = self._reqntid_clause()
+        if req:
+            e.emit(f".reqntid {req}")
         e.emit("{")
         body_at = len(e.lines)
         self.prologue()
@@ -443,6 +486,7 @@ class Compiler:
         decls = [
             f"        .reg .pred      %p<{max(self.e.np, 2)}>;",
             f"        .reg .f32       %f<{max(self.e.nf, 2)}>;",
+            f"        .reg .f64       %fd<{max(self.e.nd, 2)}>;",
             f"        .reg .b32       %r<{max(self.e.nr, 2)}>;",
             f"        .reg .b64       %rd<{max(self.e.nrd, 2)}>;",
             "",
@@ -456,8 +500,29 @@ class Compiler:
                 return int(s.block_threads)
         block = self.meta.get("block")
         if block:
-            return int(block[0])
+            prod = 1
+            for x in block:
+                prod *= int(x)
+            return prod
         return None
+
+    def _reqntid_clause(self) -> str | None:
+        block = self.meta.get("block")
+        if block and len(block) >= 2 and any(int(x) > 1 for x in block[1:]):
+            vals = [int(x) for x in list(block) + [1, 1]][:3]
+            return ", ".join(str(v) for v in vals)
+        bt = self._launch_block()
+        return str(bt) if bt else None
+
+    def _uses_sm90(self) -> bool:
+        hopper = (
+            TmaDescriptor, TmaLoad, MbarrierInit, MbarrierArrive, MbarrierArriveExpectTx,
+            MbarrierWait, SetMaxNReg, WgmmaDescriptor, WgmmaMma, WgmmaFence, WgmmaCommit, WgmmaWait,
+        )
+        return any(isinstance(s, hopper) for s in walk_stmts(self.kop.body))
+
+    def _tma_desc_names(self) -> list[str]:
+        return [s.name for s in walk_stmts(self.kop.body) if isinstance(s, TmaDescriptor)]
 
     def prologue(self) -> None:
         e = self.e
@@ -487,20 +552,58 @@ class Compiler:
                 e.emit(f"        mov.u32         {base32}, {sm.name};")
                 self.smem_base[sm.name] = base32
         tid = e.new_r()
+        tidy = e.new_r()
+        tidz = e.new_r()
         ntid = e.new_r()
+        ntidy = e.new_r()
+        ntidz = e.new_r()
+        nctay = e.new_r()
+        nctax = e.new_r()
         cta = e.new_r()
+        ctay = e.new_r()
+        ctaz = e.new_r()
+        tlin = e.new_r()
+        clin = e.new_r()
+        nprod = e.new_r()
         gid = e.new_r()
         e.emit(f"        mov.u32         {tid}, %tid.x;")
+        e.emit(f"        mov.u32         {tidy}, %tid.y;")
+        e.emit(f"        mov.u32         {tidz}, %tid.z;")
         e.emit(f"        mov.u32         {ntid}, %ntid.x;")
+        e.emit(f"        mov.u32         {ntidy}, %ntid.y;")
+        e.emit(f"        mov.u32         {ntidz}, %ntid.z;")
         e.emit(f"        mov.u32         {cta}, %ctaid.x;")
-        e.emit(f"        mad.lo.s32      {gid}, {cta}, {ntid}, {tid};")
-        e.bind("_tid", tid, "s32")
-        e.bind("_ntid", ntid, "s32")
-        e.bind("_cta", cta, "s32")
+        e.emit(f"        mov.u32         {ctay}, %ctaid.y;")
+        e.emit(f"        mov.u32         {ctaz}, %ctaid.z;")
+        e.emit(f"        mov.u32         {nctax}, %nctaid.x;")
+        e.emit(f"        mov.u32         {nctay}, %nctaid.y;")
+        # linear tid = ((z * ntid.y + y) * ntid.x + x)
+        # linear cta = ((z * nctaid.y + y) * nctaid.x + x) — not ntid
+        tmp = e.new_r()
+        e.emit(f"        mad.lo.s32      {tmp}, {tidz}, {ntidy}, {tidy};")
+        e.emit(f"        mad.lo.s32      {tlin}, {tmp}, {ntid}, {tid};")
+        e.emit(f"        mad.lo.s32      {tmp}, {ctaz}, {nctay}, {ctay};")
+        e.emit(f"        mad.lo.s32      {clin}, {tmp}, {nctax}, {cta};")
+        e.emit(f"        mul.lo.s32      {tmp}, {ntid}, {ntidy};")
+        e.emit(f"        mul.lo.s32      {nprod}, {tmp}, {ntidz};")
+        e.emit(f"        mad.lo.s32      {gid}, {clin}, {nprod}, {tlin};")
+        e.bind("_tid", tlin, "s32")
+        e.bind("_ntid", nprod, "s32")
+        e.bind("_cta", clin, "s32")
         e.bind("_gid", gid, "s32")
         e.bind("threadIdx.x", tid, "s32")
+        e.bind("threadIdx.y", tidy, "s32")
+        e.bind("threadIdx.z", tidz, "s32")
         e.bind("blockDim.x", ntid, "s32")
+        e.bind("blockDim.y", ntidy, "s32")
+        e.bind("blockDim.z", ntidz, "s32")
         e.bind("blockIdx.x", cta, "s32")
+        e.bind("blockIdx.y", ctay, "s32")
+        e.bind("blockIdx.z", ctaz, "s32")
+        for name in self.tma_descs:
+            raw = e.new_rd()
+            e.emit(f"        ld.param.u64    {raw}, [param_{name}];")
+            self.ptrs[name] = raw
         lane = e.new_r()
         warp = e.new_r()
         e.emit(f"        and.b32         {lane}, {tid}, 31;")
@@ -762,6 +865,50 @@ class Compiler:
             self.e.emit("        cp.async.commit_group;")
         elif isinstance(s, CpAsyncWait):
             self.e.emit(f"        cp.async.wait_group {int(s.group)};")
+        elif isinstance(s, Select):
+            self.emit_select(s)
+        elif isinstance(s, TmaDescriptor):
+            return
+        elif isinstance(s, TmaLoad):
+            self.emit_tma_load(s)
+        elif isinstance(s, MbarrierInit):
+            self.emit_mbar_init(s)
+        elif isinstance(s, MbarrierArriveExpectTx):
+            self.emit_mbar_expect(s)
+        elif isinstance(s, MbarrierArrive):
+            self.emit_mbar_arrive(s)
+        elif isinstance(s, MbarrierWait):
+            self.emit_mbar_wait(s)
+        elif isinstance(s, SetMaxNReg):
+            self.emit_setmaxnreg(s)
+        elif isinstance(s, RegFragment):
+            self.emit_reg_fragment(s)
+        elif isinstance(s, LdmatrixLoad):
+            self.emit_ldmatrix(s)
+        elif isinstance(s, BlockScaleLoad):
+            self.emit_block_scale(s)
+        elif isinstance(s, MmaSyncPtx):
+            self.emit_mma_sync(s)
+        elif isinstance(s, FragmentPromote):
+            self.emit_frag_promote(s)
+        elif isinstance(s, FragmentApply):
+            self.emit_frag_apply(s)
+        elif isinstance(s, FragmentRowReduce):
+            self.emit_frag_row_reduce(s)
+        elif isinstance(s, FragmentRepack):
+            self.emit_frag_repack(s)
+        elif isinstance(s, RegStore):
+            self.emit_reg_store(s)
+        elif isinstance(s, WgmmaDescriptor):
+            self.emit_wgmma_desc(s)
+        elif isinstance(s, WgmmaMma):
+            self.emit_wgmma_mma(s)
+        elif isinstance(s, WgmmaFence):
+            self.e.emit("        wgmma.fence.sync.aligned;")
+        elif isinstance(s, WgmmaCommit):
+            self.e.emit("        wgmma.commit_group.sync.aligned;")
+        elif isinstance(s, WgmmaWait):
+            self.e.emit(f"        wgmma.wait_group.sync.aligned {int(s.group)};")
         else:
             print(f"unsupported stmt {type(s).__name__}", file=sys.stderr)
             raise SystemExit(2)
@@ -1139,6 +1286,18 @@ class Compiler:
                 self.e.emit(f"        cvt.f32.f16      {dest}, {tmp};")
                 self.e.bind(name, dest, "f32")
                 regs_out.append(dest)
+            elif dt in ("bf16",):
+                tmp = self.e.new_r()
+                dest = self.e.new_f()
+                self.e.emit(f"        ld.{space}.bf16   {tmp}, [{addr}];")
+                self.e.emit(f"        cvt.f32.bf16     {dest}, {tmp};")
+                self.e.bind(name, dest, "f32")
+                regs_out.append(dest)
+            elif dt in ("f64", "double"):
+                dest = self.e.new_d()
+                self.e.emit(f"        ld.{space}.f64    {dest}, [{addr}];")
+                self.e.bind(name, dest, "f64")
+                regs_out.append(dest)
             else:
                 kind = "s32"
                 reg = self.e.new_r()
@@ -1174,6 +1333,16 @@ class Compiler:
             addr = self.addr_of(s.output, idx, space)
             if dt in ("f32", "float", "float32"):
                 self.e.emit(f"        st.{space}.{pty}   [{addr}], {self.as_f32(name)};")
+            elif dt in ("f16", "half"):
+                bits = self.e.new_r()
+                self.e.emit(f"        cvt.rn.f16.f32   {bits}, {self.as_f32(name)};")
+                self.e.emit(f"        st.{space}.f16   [{addr}], {bits};")
+            elif dt in ("bf16",):
+                bits = self.e.new_r()
+                self.e.emit(f"        cvt.rn.bf16.f32  {bits}, {self.as_f32(name)};")
+                self.e.emit(f"        st.{space}.bf16  [{addr}], {bits};")
+            elif dt in ("f64", "double"):
+                self.e.emit(f"        st.{space}.f64   [{addr}], {self.as_f64(name)};")
             else:
                 self.e.emit(f"        st.{space}.{pty}   [{addr}], {self.as_s32(name)};")
 
@@ -1516,6 +1685,14 @@ class Compiler:
         self.e.emit(f"        mad.lo.s32      {addr}, {idx_reg}, {nb}, {base};")
         self.e.emit(f"        st.shared.f32   [{addr}], {src};")
 
+    def as_f64(self, name: str) -> str:
+        if name in self.e.env and self.e.kind.get(name) == "f64":
+            return self.e.env[name]
+        src = self.as_f32(name)
+        d = self.e.new_d()
+        self.e.emit(f"        cvt.f64.f32      {d}, {src};")
+        return d
+
     def as_f32(self, name: str) -> str:
         if name in self.e.env and self.e.kind.get(name) == "f32":
             return self.e.env[name]
@@ -1618,9 +1795,15 @@ class Compiler:
             raise SystemExit(2)
         if isinstance(expr, Builtin):
             mapping = {
-                "threadIdx.x": "_tid",
-                "blockDim.x": "_ntid",
-                "blockIdx.x": "_cta",
+                "threadIdx.x": "threadIdx.x",
+                "threadIdx.y": "threadIdx.y",
+                "threadIdx.z": "threadIdx.z",
+                "blockDim.x": "blockDim.x",
+                "blockDim.y": "blockDim.y",
+                "blockDim.z": "blockDim.z",
+                "blockIdx.x": "blockIdx.x",
+                "blockIdx.y": "blockIdx.y",
+                "blockIdx.z": "blockIdx.z",
             }
             name = mapping.get(expr.name, expr.name)
             return "s32", self.e.env[name]
@@ -1793,6 +1976,245 @@ class Compiler:
             raise SystemExit(2)
         return "s32", d
 
+    def emit_select(self, s: Select) -> None:
+        dest = self.e.new_f()
+        first = True
+        for br in s.branches:
+            p = self.expr_pred(br.select)
+            val = self.as_f32(br.value)
+            if first:
+                z = self.e.imm_f32(0.0)
+                self.e.emit(f"        selp.f32        {dest}, {val}, {z}, {p};")
+                first = False
+            else:
+                self.e.emit(f"        selp.f32        {dest}, {val}, {dest}, {p};")
+        self.e.bind(s.name, dest, "f32")
+
+    def _mbar_addr(self, name: str, slot) -> str:
+        base = self.smem_base.get(name) or self.e.imm_s32(0)
+        if slot is None:
+            return str(base)
+        off = self.expr_s32(slot)
+        addr = self.e.new_r()
+        self.e.emit(f"        mad.lo.s32      {addr}, {off}, 8, {base};")
+        return addr
+
+    def emit_mbar_init(self, s: MbarrierInit) -> None:
+        self.stats["mbarrier"] += 1
+        addr = self._mbar_addr(s.mbar, s.slot)
+        self.e.emit(f"        mbarrier.init.shared.b64 [{addr}], {int(s.count)};")
+
+    def emit_mbar_expect(self, s: MbarrierArriveExpectTx) -> None:
+        self.stats["mbarrier"] += 1
+        addr = self._mbar_addr(s.mbar, s.slot)
+        self.e.emit(f"        mbarrier.arrive.expect_tx.shared.b64 [{addr}], {int(s.bytes_)};")
+
+    def emit_mbar_arrive(self, s: MbarrierArrive) -> None:
+        self.stats["mbarrier"] += 1
+        addr = self._mbar_addr(s.mbar, s.slot)
+        self.e.emit(f"        mbarrier.arrive.shared.b64 [{addr}];")
+
+    def emit_mbar_wait(self, s: MbarrierWait) -> None:
+        self.stats["mbarrier"] += 1
+        addr = self._mbar_addr(s.mbar, s.slot)
+        phase = self.expr_s32(s.phase)
+        p = self.e.new_p()
+        spin = self.e.label("MBAR")
+        self.e.emit(f"{spin}:")
+        self.e.emit(f"        mbarrier.try_wait.parity.shared.b64 {p}, [{addr}], {phase};")
+        skip = self.e.new_p()
+        self.e.emit(f"        not.pred        {skip}, {p};")
+        self.e.emit(f"        @{skip} bra      {spin};")
+
+    def emit_tma_load(self, s: TmaLoad) -> None:
+        self.stats["tma"] += 1
+        dst = self.addr_of(s.smem, s.smem_index, "shared")
+        desc = self.ptrs.get(s.desc, s.desc)
+        coords = ", ".join(self.expr_s32(c) for c in s.coords)
+        mbar = self._mbar_addr(s.mbar, s.mbar_slot)
+        rank = max(len(s.coords), 1)
+        self.e.emit(
+            f"        cp.async.bulk.tensor.{rank}d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
+            f"[{dst}], [{desc}], {{{coords}}}, [{mbar}];"
+        )
+        self._kill_mem(s.smem)
+
+    def emit_setmaxnreg(self, s: SetMaxNReg) -> None:
+        d = "inc" if str(s.direction).lower() in ("inc", "increase", "up") else "dec"
+        self.e.emit(f"        setmaxnreg.{d}.sync.aligned.u32 {int(s.count)};")
+
+    def _frag_nregs(self, role: str, shape, dtype: str, nregs) -> int:
+        if nregs:
+            return int(nregs)
+        m, n, k = (int(x) for x in shape[:3]) if shape else (16, 8, 16)
+        dt = dtype_name(dtype) if not isinstance(dtype, str) else dtype
+        if role.lower() in ("c", "d", "acc"):
+            return 4 if (m, n) in ((16, 8), (16, 16)) else 8
+        if role.lower() == "a":
+            return 4 if dt in ("f16", "bf16", "half") else 8
+        return 2 if dt in ("f16", "bf16", "half") else 4
+
+    def emit_reg_fragment(self, s: RegFragment) -> None:
+        dt = dtype_name(s.dtype)
+        n = self._frag_nregs(s.role, s.shape, dt, s.nregs)
+        kind = "f32" if str(s.role).lower() in ("c", "d", "acc") or dt in ("f32", "float") else "b32"
+        regs = [self.e.new_f() if kind == "f32" else self.e.new_r() for _ in range(n)]
+        self.frags[s.name] = {"role": s.role, "dtype": dt, "regs": regs, "shape": tuple(s.shape), "kind": kind}
+        if str(s.role).lower() in ("c", "d", "acc"):
+            z = self.e.imm_f32(0.0)
+            for r in regs:
+                self.e.emit(f"        mov.f32         {r}, {z};")
+
+    def emit_ldmatrix(self, s: LdmatrixLoad) -> None:
+        self.stats["ldmatrix"] += 1
+        frag = self.frags.get(s.frag)
+        if frag is None:
+            regs = [self.e.new_r() for _ in range(4)]
+            self.frags[s.frag] = {"role": s.role, "dtype": "f16", "regs": regs, "shape": (16, 8, 16), "kind": "b32"}
+            frag = self.frags[s.frag]
+        space = "shared" if s.src_buffer in self.smem else "global"
+        addr = self.addr_of(s.src_buffer, s.src_index, space)
+        regs = frag["regs"]
+        x = {2: "x2", 4: "x4"}.get(len(regs), "x4")
+        packed = ", ".join(regs[: 4 if x == "x4" else 2])
+        trans = ".trans" if s.b_trans else ""
+        self.e.emit(f"        ldmatrix.sync.aligned.{x}.m8n8{trans}.shared.b16 {{{packed}}}, [{addr}];")
+
+    def emit_block_scale(self, s: BlockScaleLoad) -> None:
+        addr = self.addr_of(s.src_buffer, s.src_index, "shared" if s.src_buffer in self.smem else "global")
+        dest = self.e.new_r()
+        self.e.emit(f"        ld.shared.b8    {dest}, [{addr}];")
+        self.frags[s.frag] = {"role": s.role, "dtype": "u8", "regs": [dest], "shape": (1, 1, 1), "kind": "b32"}
+
+    def emit_mma_sync(self, s: MmaSyncPtx) -> None:
+        self.stats["mma"] += 1
+        a = self.frags.get(s.a_frag, {}).get("regs") or [self.e.new_r() for _ in range(4)]
+        b = self.frags.get(s.b_frag, {}).get("regs") or [self.e.new_r() for _ in range(2)]
+        c = self.frags.get(s.c_frag, {}).get("regs") or [self.e.new_f() for _ in range(4)]
+        m, n, k = (int(x) for x in s.shape[:3])
+        layout = "row.col" if not s.b_row_major else "row.row"
+        ab, cd = s.ab_dtype, s.c_dtype
+        al = ", ".join(a[:4])
+        bl = ", ".join(b[:2])
+        cl = ", ".join(c[:4])
+        self.e.emit(
+            f"        mma.sync.aligned.m{m}n{n}k{k}.{layout}.{cd}.{ab}.{ab}.{cd} "
+            f"{{{cl}}}, {{{al}}}, {{{bl}}}, {{{cl}}};"
+        )
+
+    def emit_frag_promote(self, s: FragmentPromote) -> None:
+        src = self.frags.get(s.src, {}).get("regs") or []
+        dst_regs = []
+        for r in src:
+            d = self.e.new_f()
+            self.e.emit(f"        cvt.f32.f16      {d}, {r};")
+            dst_regs.append(d)
+        self.frags[s.dst] = {"role": "c", "dtype": "f32", "regs": dst_regs or [self.e.new_f()], "shape": (16, 8, 16), "kind": "f32"}
+
+    def emit_frag_apply(self, s: FragmentApply) -> None:
+        out = self.frags.get(s.out) or self.frags.get(s.args[0] if s.args else "", {})
+        regs = list((out or {}).get("regs") or [])
+        op = s.op.name if hasattr(s.op, "name") else str(s.op)
+        inst = F32_OPS.get(op)
+        for i, r in enumerate(regs):
+            extras = []
+            for a, kind in zip(s.args, s.kinds or ()):
+                if kind == "frag" and isinstance(a, str) and a in self.frags:
+                    extras.append(self.frags[a]["regs"][min(i, len(self.frags[a]["regs"]) - 1)])
+                elif kind in ("uniform", "scalar") and isinstance(a, str):
+                    extras.append(self.as_f32(a))
+            if inst and extras:
+                self.e.emit(f"        {inst:<16}{r}, {r}, {extras[0]};")
+            elif op == "relu":
+                self.e.emit(f"        max.f32         {r}, {r}, {f32_hex(0.0)};")
+
+    def emit_frag_row_reduce(self, s: FragmentRowReduce) -> None:
+        op = s.op.name if hasattr(s.op, "name") else str(s.op)
+        inst = F32_OPS.get(op, "add.f32")
+        acc_t, acc_b = self.e.new_f(), self.e.new_f()
+        z = self.e.imm_f32(0.0)
+        self.e.emit(f"        mov.f32         {acc_t}, {z};")
+        self.e.emit(f"        mov.f32         {acc_b}, {z};")
+        for name in s.frags:
+            regs = self.frags.get(name, {}).get("regs") or []
+            if len(regs) >= 2:
+                self.e.emit(f"        {inst:<16}{acc_t}, {acc_t}, {regs[0]};")
+                self.e.emit(f"        {inst:<16}{acc_b}, {acc_b}, {regs[2] if len(regs) > 2 else regs[1]};")
+        self.e.bind(s.top, acc_t, "f32")
+        self.e.bind(s.bot, acc_b, "f32")
+
+    def emit_frag_repack(self, s: FragmentRepack) -> None:
+        regs = []
+        for src in s.srcs:
+            for r in self.frags.get(src, {}).get("regs") or []:
+                bits = self.e.new_r()
+                self.e.emit(f"        cvt.rn.f16.f32   {bits}, {r};")
+                regs.append(bits)
+        self.frags[s.frag] = {"role": "a", "dtype": s.ab_dtype, "regs": regs[:4] or [self.e.new_r()], "shape": (16, 8, 16), "kind": "b32"}
+
+    def emit_reg_store(self, s: RegStore) -> None:
+        frag = self.frags.get(s.frag, {})
+        regs = frag.get("regs") or []
+        space = "shared" if s.dst_buffer in self.smem else "global"
+        lane = self.e.env.get("lane") or self.as_s32("lane")
+        group = self.e.new_r()
+        t = self.e.new_r()
+        self.e.emit(f"        shr.u32         {group}, {lane}, 2;")
+        self.e.emit(f"        and.b32         {t}, {lane}, 3;")
+        # m16n8 C layout: rows group / group+8, cols 2*t / 2*t+1
+        pairs = [(0, 0), (0, 1), (8, 0), (8, 1)]
+        for i, r in enumerate(regs[:4]):
+            ro, co = pairs[i]
+            row = self.e.new_r()
+            col = self.e.new_r()
+            self.e.emit(f"        add.s32         {row}, {group}, {ro};")
+            self.e.emit(f"        mad.lo.s32      {col}, {t}, 2, {co};")
+            if s.row_base is not None:
+                row = self.add_s32(row, self.expr_s32(s.row_base))
+            if s.col_base is not None:
+                col = self.add_s32(col, self.expr_s32(s.col_base))
+            idx = list(s.dst_index) + [None, None]
+            # last two coords replaced by computed row/col if 2D buffer
+            if len(s.dst_index) >= 2:
+                addr = self.addr_of(s.dst_buffer, tuple(list(s.dst_index[:-2]) + [Var("__row"), Var("__col")]) if False else s.dst_index, space)
+            nb = nbytes_of(self.dtypes.get(s.dst_buffer, "f32"))
+            base = self.ptrs.get(s.dst_buffer) or self.smem_base.get(s.dst_buffer)
+            flat = self.e.new_r()
+            ld = int(s.ldm) if s.ldm else int((self.shapes.get(s.dst_buffer) or [0, 8])[-1])
+            self.e.emit(f"        mad.lo.s32      {flat}, {row}, {ld}, {col};")
+            ptr = self.e.new_rd()
+            self.e.emit(f"        mad.wide.s32    {ptr}, {flat}, {nb}, {base};")
+            if s.atomic:
+                self.e.emit(f"        red.{space}.add.f32 [{ptr}], {r};")
+            else:
+                self.e.emit(f"        st.{space}.f32   [{ptr}], {r};")
+
+    def emit_wgmma_desc(self, s: WgmmaDescriptor) -> None:
+        smem_idx = self.flatten(s.smem, (s.smem_index,) if s.smem_index is not None else (Literal(0, "int"),))
+        base = self.smem_base[s.smem]
+        desc = self.e.new_rd()
+        self.e.emit(f"        cvt.u64.u32      {desc}, {base};")
+        self.e.emit(f"        // wgmma desc {s.name} swizzle={s.swizzle} lbo={s.lbo_bytes} sbo={s.sbo_bytes}")
+        self.e.bind(s.name, desc, "s32")
+        self.ptrs[s.name] = desc
+        _ = smem_idx
+
+    def emit_wgmma_mma(self, s: WgmmaMma) -> None:
+        self.stats["wgmma"] += 1
+        m, n, k = (int(x) for x in s.shape[:3])
+        acc = []
+        for name in s.c_frags:
+            acc.extend(self.frags.get(name, {}).get("regs") or [])
+        if not acc:
+            acc = [self.e.new_f() for _ in range(4)]
+        cl = ", ".join(acc[:4])
+        b = self.ptrs.get(s.b_desc, s.b_desc)
+        a = self.ptrs.get(s.a_desc or "", "") or (self.frags.get(s.a_frag or "", {}) or {}).get("regs", [self.e.new_r()])[0]
+        self.e.emit(
+            f"        wgmma.mma_async.sync.aligned.m{m}n{n}k{k}.f32.{s.ab_dtype}.{s.ab_dtype} "
+            f"{{{cl}}}, {a}, {b}, {int(s.scale_d)}, {int(s.trans_a)}, {int(s.trans_b)};"
+        )
+
 
 def compile_ir(path: Path) -> str:
     return compile_bundle(path)["ptx"]
@@ -1836,6 +2258,7 @@ def compile_bundle(path: Path) -> dict:
         "virt_regs": {
             "pred": compiler.e.np,
             "f32": compiler.e.nf,
+            "f64": compiler.e.nd,
             "b32": compiler.e.nr,
             "b64": compiler.e.nrd,
         },

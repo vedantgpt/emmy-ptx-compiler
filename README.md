@@ -16,3 +16,10 @@ python tools/studio.py
 ```
 
 Walkthrough notes for the required video: [WALKTHROUGH.md](WALKTHROUGH.md).
+
+**Features judges asked for after the open-set filter** (tensor cores, TMA/mbarrier, f16/bf16/f64, 2-D/3-D launch): [FEATURES.md](FEATURES.md).
+
+```bash
+python -m unittest discover -s tests -q
+python examples/extra_isa.py
+```

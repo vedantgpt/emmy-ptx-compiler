@@ -2,3 +2,14 @@
 __pycache__/
 *.pyc
 .tmp/
+.DS_Store
+
+# organizer-only evaluation material
+hidden/
+hidden_full/
+expressions_hidden.py
+
+# locally generated proxy problems (not the official hidden set)
+problems_proxy/
+problems_world/
+tmp_ptx/

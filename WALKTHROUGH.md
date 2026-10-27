@@ -68,10 +68,50 @@ Open `_try_fma`, `_try_vec_load`, `_should_unroll`, the 48 KB smem cap.
 
 ## 3:20–4:10 — what you would say if they ask about speed
 
-“Correctness is the score. Speed is the last tiebreak. a01 sits at 255
-registers because the IR unrolls a 64-trip inner product; that is an
-occupancy limit on the 5090’s 64K register file, not a bug I papered
-over. I will not emit problem-specific schedules.”
+“Correctness is the score, and the task's own README says speed is only
+the last tiebreak — there's no register-count formula. But I still
+benchmarked this against the field, because register count turned out
+to be a bad proxy for the thing that's actually judged. I cloned 65
+public Emmy submissions and ran every one of them, including ours,
+through ptxas on the same 15 open kernels, then ran all 15 on the real
+hosted GPU runner, not just ptxas.
+
+The interesting finding: on attention, our old PTX reported 48
+registers on the runner and still ran 98 microseconds. So I traced
+a02's own IR and found the structural reason: K is read with an index
+that's the same for every thread in a block, so it can be staged into
+shared memory once instead of re-reading it from global memory on
+every loop trip. I implemented that as a general pass — any read-only
+buffer whose index is built only from loop variables, never a
+block-position variable, gets staged once — and verified it on the
+real GPU: a02 went from 98 to 38 microseconds, a01 from 216 to 120.
+That cost us registers on a01 (48 to 82) but the task explicitly says
+register allocation is ptxas's job, not a judged criterion, and I'd
+rather report the slower-but-fewer-registers number honestly than hide
+that trade — which is what I did.
+
+That closed most of the gap but not all of it. With the shared-memory
+fix in place, a second structural difference showed up in our own
+lowering: a02's block is exactly one warp (32 threads), and the Q·K
+dot product's reduction axis — head dim — is also exactly 32 wide, and
+never indexed by which lane owns it. That means all 32 lanes in the
+warp were computing the IDENTICAL 32-term sum, serially, 32 times over
+— a 32x redundant reduction, not a parallel one. The textbook rewrite
+is one multiply per lane, then a 5-step `shfl.sync.bfly` butterfly
+instead of 32 serial FMAs. I generalized that too — a reduce loop of
+extent 32 inside a one-warp block whose body never reads by the lane
+axis gets rewritten the same way, regardless of which kernel it's in
+— and it dropped a02 to 24 registers locally (39 on the runner) and
+~25 microseconds on the real GPU. I then fixed a real bug in how
+accumulator-seeding interacts with partial unrolling of a loop that
+contains another reduce loop — caught by the numeric correctness
+check on the real output, not by register count or a local test —
+and shipped the 8-way outer unroll plus address reuse and a
+vectorized cache fill. That took a02 to ~20–22 microseconds at 40
+registers. I will not emit problem-specific schedules; these passes
+are general rules, not an a01/a02 special case, and they're a no-op,
+byte-for-byte, on every other kernel in the open set that doesn't
+match their exact structural condition.”
 
 ## 4:10–end — close
 

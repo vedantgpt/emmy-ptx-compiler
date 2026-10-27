@@ -1,7 +1,7 @@
 import unittest
 
 import numpy as np
-from emmy.compiler.ir.expr import Literal
+from emmy.compiler.ir.expr import FlatIndex, Literal, Var
 from emmy.compiler.ir.kernel.ir import (
     DataType,
     KernelOp,
@@ -13,6 +13,7 @@ from emmy.compiler.ir.kernel.ir import (
     TmaDescriptor,
     TmaLoad,
 )
+from emmy.compiler.ir.stmt import Carry, Let, Load, Pre, Write, ZeroPrologue
 
 import compile as C
 
@@ -61,6 +62,26 @@ class ExtraIsa(unittest.TestCase):
         self.assertIn("%ctaid.y", ptx)
         self.assertIn("param_tensormap", ptx)
         self.assertNotIn("unsupported", ptx)
+
+    def test_nc_loads_pre_carry_zero_flatindex(self):
+        zp = ZeroPrologue("out", 32)
+        let = Let("off", FlatIndex("x", (Literal(0, "int"),)), "i32")
+        ld = Load(names=("in0",), input="x", index=(Var("off"),), dtype=F32)
+        cr = Carry("st", "in0", (Literal(0, "int"),), 0.0, F32)
+        pr = Pre("old", "st", (Literal(0, "int"),))
+        wr = Write(output="out", index=(Literal(0, "int"),), values=("old",), value_dtype=F32)
+        kop = KernelOp(name="k_extra_nodes", body=(zp, let, ld, cr, pr, wr))
+        ptx = C.Compiler(
+            kop,
+            shapes={"x": (32,), "out": (32,)},
+            dtypes={"x": "f32", "out": "f32"},
+            args=["x", "out"],
+            meta={"block": [32, 1, 1], "grid": [1, 1, 1]},
+        ).run()
+        self.assertIn("ld.global.nc.f32", ptx)
+        self.assertIn("st.global.u32", ptx)
+        self.assertNotIn("unsupported", ptx)
+        self.assertNotIn("unbound var", ptx)
 
 
 if __name__ == "__main__":

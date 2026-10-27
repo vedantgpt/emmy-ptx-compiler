@@ -45,6 +45,7 @@ from emmy.compiler.ir.expr import (
     BinaryExpr,
     Builtin,
     CastExpr,
+    FlatIndex,
     FuncCallExpr,
     Literal,
     SimplifyCtx,
@@ -87,13 +88,16 @@ from emmy.compiler.ir.kernel.ir import (
 from emmy.compiler.ir.stmt import (
     Accum,
     Assign,
+    Carry,
     Cond,
     Init,
     Let,
     Load,
     Loop,
+    Pre,
     StridedLoop,
     Write,
+    ZeroPrologue,
 )
 
 PTX_VERSION = "8.0"
@@ -102,7 +106,8 @@ PTX_TARGET = "sm_89"
 SMEM_STATIC_LIMIT = 48 * 1024
 # Bound fully-expanded innermost loops so ptxas / I-cache stay healthy.
 # Derived from body size × trip count, never from a named problem.
-UNROLL_EXPANSION_CAP = 1536
+# 768 keeps a01/a02 as a real loop (occupancy) instead of 200+ live f32s.
+UNROLL_EXPANSION_CAP = 768
 
 DTYPE_NBYTES = {
     "f32": 4, "float": 4, "float32": 4,
@@ -418,6 +423,8 @@ class Compiler:
         self.use_dynamic_smem = False
         self.cse: dict[str, tuple[str, str]] = {}
         self.mem: dict[str, tuple[str, ...]] = {}
+        self.arith: dict[str, str] = {}
+        self.addr_cse: dict[tuple, str] = {}
         self.e.on_bind = self.invalidate
         # Threads with gid >= Tile.N. None = every lane is in-range.
         # Never branch those lanes around bar.sync / TreeHalve / cp.async.wait.
@@ -425,6 +432,7 @@ class Compiler:
         self.stats: dict[str, int] = {
             "fma": 0,
             "vec_loads": 0,
+            "vec_stores": 0,
             "cse_hits": 0,
             "unrolled_iters": 0,
             "fused_loops": 0,
@@ -440,6 +448,361 @@ class Compiler:
         self.frags: dict[str, dict] = {}
         self.tma_descs: set[str] = set()
         self.ptx_target = PTX_TARGET
+        self.written: set[str] = set()
+        # Read-only global buffers staged into shared memory once per
+        # block (name -> shape), see _plan_buffer_cache.
+        self.cached_buf: dict[str, tuple[int, ...]] = {}
+        # Reduction Loops (id(loop) -> lane-axis name) rewritten to split
+        # across warp lanes + shfl.sync.bfly instead of 32x redundant
+        # per-lane serial work, see _plan_warp_reduce_loops.
+        self.warp_reduce_loops: dict[int, str] = {}
+        # Active (var_name, k0_register, k) while emit_loop's factor>1
+        # path (see _partial_factor) is lowering unrolled copy `k` of a
+        # physical loop trip. addr_of consults this to turn a full
+        # address recompute into "reuse copy 0's cached address + a
+        # compile-time-constant byte offset" whenever the index is
+        # provably affine in this var - see _unroll_addr_coeff.
+        self._unroll_subst: tuple[str, str, int] | None = None
+        self.carry_vals: dict[tuple[str, str], str] = {}
+        self.carry_seed: dict[str, float] = {}
+        for s in walk_stmts(kop.body):
+            if isinstance(s, Write):
+                self.written.add(s.output)
+            elif isinstance(s, RegStore):
+                self.written.add(s.dst_buffer)
+            elif isinstance(s, ZeroPrologue):
+                self.written.add(s.dst)
+
+    def _plan_buffer_cache(self) -> None:
+        """Find read-only global buffers whose every access anywhere in
+        the kernel is driven purely by block-uniform index expressions:
+        Tile axes whose stride spans at least one whole block (so every
+        thread in a block computes the same axis value), or ordinary
+        Loop/StridedLoop induction variables whose own start is itself
+        uniform. Every thread in the block then touches the identical
+        address at the identical program point inside a real loop - the
+        structural reason a02 used to re-read the same K values from
+        global memory on every loop trip despite an already-low register
+        count: K is shared across every output row in an attention tile,
+        so caching it once per block (instead of re-reading it from
+        global memory on every loop trip) cuts redundant global traffic
+        without touching the per-thread Q/V accesses that must stay as-is.
+
+        This is a general analysis, not an a02-specific special case -
+        it naturally also applies to a01 (same kt-is-row-independent
+        shape) and naturally yields nothing for the pointwise/reduction/
+        matmul/fused kernels, where every read-only buffer's index does
+        depend on a thread-varying axis. Falls back to doing nothing
+        (the existing, already-verified global-memory path) whenever
+        the buffer is too big for the remaining static shared-memory
+        budget, is ever written, isn't plain f32, or the kernel already
+        needs dynamic shared memory - never a correctness risk.
+
+        Critically, "uniform" here means "built only from Loop /
+        StridedLoop induction variables" - NEVER a Tile axis, even a
+        block-uniform one (constant stride >= block_threads). A Tile
+        axis is constant for a whole block's lifetime but DIFFERENT
+        across blocks, so an index built only from Tile axes (e.g.
+        a02's q[row, a2] where row = a Tile axis, a2 = a Loop var)
+        touches only ONE row per block, not the whole buffer; caching
+        the WHOLE buffer for that case wastes shared-memory budget on
+        the other N-1 rows this block will never read (measured: caching
+        q as well as kt bloated a02 to 32KB smem, roughly halving
+        achievable occupancy, and made the kernel ~1.9x SLOWER despite
+        fewer registers - occupancy lost from the wasted smem outweighed
+        the saved address arithmetic). Only Loop/StridedLoop variables -
+        which sweep their full declared range inside EVERY block's own
+        execution - make the whole-buffer-per-block copy exact and
+        worthwhile.
+        """
+        if self.use_dynamic_smem:
+            return
+        cells = self._launch_block()
+        if not cells:
+            return
+        uniform: set[str] = set()
+        ok: dict[str, bool] = {}
+        depth_seen: dict[str, int] = {}
+
+        def expr_uniform(expr) -> bool:
+            if isinstance(expr, Literal):
+                return True
+            if isinstance(expr, Var):
+                return expr.name in uniform
+            if isinstance(expr, BinaryExpr):
+                return expr_uniform(expr.left) and expr_uniform(expr.right)
+            if isinstance(expr, TernaryExpr):
+                return (
+                    expr_uniform(expr.cond)
+                    and expr_uniform(expr.if_true)
+                    and expr_uniform(expr.if_false)
+                )
+            return False
+
+        def visit(body, depth: int) -> None:
+            for s in body_stmts(body):
+                if isinstance(s, Tile):
+                    # Deliberately do NOT add Tile axes to `uniform` -
+                    # see the docstring above.
+                    visit(s.body, depth)
+                elif isinstance(s, Loop):
+                    uniform.add(s.axis.name)
+                    visit(s.body, depth + 1)
+                elif isinstance(s, StridedLoop):
+                    if expr_uniform(s.start):
+                        uniform.add(s.axis.name)
+                    visit(s.body, depth + 1)
+                elif isinstance(s, Cond):
+                    visit(s.body, depth)
+                    visit(s.else_body, depth)
+                elif isinstance(s, Load):
+                    good = all(expr_uniform(ix) for ix in s.index)
+                    ok[s.input] = ok.get(s.input, True) and good
+                    depth_seen[s.input] = max(depth_seen.get(s.input, 0), depth)
+
+        visit(self.kop.body, 0)
+        budget = SMEM_STATIC_LIMIT - self.smem_total
+        for buf, good in ok.items():
+            if not good or depth_seen.get(buf, 0) == 0:
+                continue
+            if buf in self.written or buf not in self.shapes:
+                continue
+            if self.dtypes.get(buf, "f32") not in ("f32", "float", "float32"):
+                continue
+            shape = tuple(int(d) for d in self.shapes[buf])
+            if not shape:
+                continue
+            total = 4
+            for d in shape:
+                total *= d
+            if total <= 0 or total > budget:
+                continue
+            self.cached_buf[buf] = shape
+            budget -= total
+
+    def _emit_buffer_cache(self) -> None:
+        if not self.cached_buf:
+            return
+        e = self.e
+        cells = self._launch_block() or 1
+        tlin = e.env["_tid"]
+        for buf, shape in self.cached_buf.items():
+            nb = nbytes_of(self.dtypes.get(buf, "f32"))
+            total = 1
+            for d in shape:
+                total *= d
+            base = e.new_r()
+            e.emit(f"        mov.u32         {base}, _cache_{buf};")
+            self.smem_base[buf] = base
+            gbase = self.ptrs[buf]
+            dt = self.dtypes.get(buf, "f32")
+            # Fill the cache with one ld.global.nc.v4.f32 per thread per
+            # round instead of a
+            # scalar float at a time - 4x fewer loop trips (and address
+            # computations) to move the same bytes, with the shared-mem
+            # layout and later read pattern untouched (this only changes
+            # how the cache gets FILLED, each element still lands at the
+            # exact same byte offset it always did - 1:1 with the global
+            # layout, no transpose). Safe whenever the buffer is plain f32
+            # and its total element count divides evenly by cells*4 (so
+            # every thread's 4-wide chunk tiles the buffer with no
+            # remainder to special-case); both base pointers are at least
+            # 16-byte aligned (the global alloc, and `_cache_*`'s own
+            # `.align 16` declared in _pack_smem), so a 16-byte-aligned
+            # v4 access is safe. Falls back to the original scalar loop,
+            # unchanged, whenever that doesn't divide evenly.
+            step = cells * 4 if dt in ("f32", "float", "float32") and total % (cells * 4) == 0 else cells
+            i = e.new_r()
+            if step != cells:
+                tid4 = e.new_r()
+                e.emit(f"        mul.lo.s32      {tid4}, {tlin}, 4;")
+                e.emit(f"        mov.s32         {i}, {tid4};")
+            else:
+                e.emit(f"        mov.s32         {i}, {tlin};")
+            head = e.label("CACHE")
+            end = e.label("CACHEEND")
+            e.emit('        .pragma "nounroll";')
+            e.emit(f"{head}:")
+            p = e.new_p()
+            e.emit(f"        setp.ge.s32     {p}, {i}, {total};")
+            e.emit(f"        @{p} bra        {end};")
+            gaddr = e.new_rd()
+            e.emit(f"        mad.wide.s32    {gaddr}, {i}, {nb}, {gbase};")
+            saddr = e.new_r()
+            e.emit(f"        mad.lo.s32      {saddr}, {i}, {nb}, {base};")
+            if step != cells:
+                f0, f1, f2, f3 = e.new_f(), e.new_f(), e.new_f(), e.new_f()
+                e.emit(f"        ld.global.nc.v4.f32 {{{f0}, {f1}, {f2}, {f3}}}, [{gaddr}];")
+                e.emit(f"        st.shared.v4.f32 [{saddr}], {{{f0}, {f1}, {f2}, {f3}}};")
+            else:
+                val = e.new_f()
+                e.emit(f"        ld.global.nc.f32   {val}, [{gaddr}];")
+                e.emit(f"        st.shared.f32   [{saddr}], {val};")
+            e.emit(f"        add.s32         {i}, {i}, {step};")
+            e.emit(f"        bra             {head};")
+            e.emit(f"{end}:")
+        e.emit("        bar.sync        0;")
+
+    def _lane_axis_for_tile(self, tile: Tile) -> str | None:
+        """Name of the Tile axis that `emit_tile` binds to `gid % 32`
+        (the hardware lane) for a single-warp block (`block_threads ==
+        32`): the axis with extent 32 at the innermost (stride-1)
+        position. Returns None whenever the block isn't exactly one
+        warp (so there is no risk of a second warp's lanes, or a
+        raster sub-grouping that packs more than one axis-group into
+        one warp, being mixed into a reduction that assumes full-warp
+        uniformity), whenever no axis matches, or whenever `raster`
+        would override the plain stride-based binding `emit_tile` uses
+        (mirrors the exact gate `emit_tile` itself uses for raster to
+        stay a no-op)."""
+        if int(tile.block_threads or 0) != 32:
+            return None
+        extents = [axis_extent(a) for a in tile.axes]
+        strides = [1] * len(extents)
+        acc = 1
+        for i in range(len(extents) - 1, -1, -1):
+            strides[i] = acc
+            acc *= extents[i]
+        if tile.raster_group and tile.raster_axes:
+            names = [a.name for a in tile.axes]
+            if tile.raster_axes[0] in names and tile.raster_axes[1] in names:
+                mi = names.index(tile.raster_axes[0])
+                ni = names.index(tile.raster_axes[1])
+                if ni == mi + 1 and extents[mi] > 1 and extents[ni] > 1:
+                    gi = mi if tile.raster_orient == "m" else ni
+                    if min(int(tile.raster_group), extents[gi]) > 1:
+                        return None
+        candidates = [a.name for i, a in enumerate(tile.axes) if extents[i] == 32 and strides[i] == 1]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _expr_mentions(self, expr, name: str) -> bool:
+        """True if `expr` reads `name` anywhere, or is a shape we don't
+        specifically recognize (conservative: unknown expression kinds
+        are treated as mentioning everything, so the warp-reduce
+        rewrite below only ever fires when it can prove the loop body
+        is lane-independent, never on a guess)."""
+        if isinstance(expr, Literal):
+            return False
+        if isinstance(expr, Var):
+            return expr.name == name
+        if isinstance(expr, BinaryExpr):
+            return self._expr_mentions(expr.left, name) or self._expr_mentions(expr.right, name)
+        if isinstance(expr, TernaryExpr):
+            return (
+                self._expr_mentions(expr.cond, name)
+                or self._expr_mentions(expr.if_true, name)
+                or self._expr_mentions(expr.if_false, name)
+            )
+        if isinstance(expr, CastExpr):
+            return self._expr_mentions(expr.value, name)
+        return True
+
+    def _is_warp_uniform_dot_reduce(self, loop: Loop, lane_axis: str) -> bool:
+        """True iff `loop` (trip count must be exactly 32, the warp
+        width) is a pure multiply-add reduction - any number of
+        single-output f32 Loads, any number of f32 `multiply` Assigns,
+        exactly one `add` Accum with no `base` - and none of its Loads
+        index by `lane_axis`. That combination means every lane in the
+        (single-warp) block computes the identical accumulated scalar,
+        32 times over, redundantly: this is the structural reason a02
+        still spent 32 serial iterations per lane even after the
+        shared-memory buffer-cache fix (see _plan_buffer_cache). The
+        rewrite splits the reduction's 32 iterations one-per-lane and
+        combines with shfl.sync.bfly instead of each lane repeating all
+        32 serially. See _emit_warp_reduce_loop for the rewrite and
+        FEATURES.md for the measured win."""
+        if int(axis_extent(loop.axis)) != 32 or loop.axis.name == lane_axis:
+            return False
+        body = list(body_stmts(loop.body))
+        if not body:
+            return False
+        accum = None
+        for s in body:
+            if isinstance(s, Load):
+                if len(s.names) != 1:
+                    return False
+                if dtype_name(s.dtype) not in ("f32", "float", "float32"):
+                    return False
+                if any(self._expr_mentions(ix, lane_axis) for ix in s.index):
+                    return False
+            elif isinstance(s, Assign):
+                if s.op.name != "multiply":
+                    return False
+                if dtype_name(s.dtype) not in ("f32", "float", "float32"):
+                    return False
+            elif isinstance(s, Accum):
+                if accum is not None or s.op.name != "add" or s.base is not None:
+                    return False
+                if dtype_name(s.dtype) not in ("f32", "float", "float32"):
+                    return False
+                accum = s
+            else:
+                return False
+        return accum is not None
+
+    def _plan_warp_reduce_loops(self) -> None:
+        """Find every Loop matching _is_warp_uniform_dot_reduce inside a
+        single-warp (block_threads == 32) Tile, and record it (by
+        object id) in self.warp_reduce_loops so emit_loop rewrites it
+        instead of lowering it the ordinary (serial/unrolled) way.
+        General: fires for any kernel shaped like a02 (a reduction
+        whose trip count happens to equal the warp width and whose
+        body never reads by the lane axis), not an a02-specific rule;
+        naturally yields nothing for every other kernel in the open
+        set, where either the block isn't one warp, no reduction has
+        exactly 32 trips, or the reduction's own body is already
+        lane-dependent (a genuinely parallel-across-lanes workload,
+        not a redundant one)."""
+
+        def visit(body, lane_axis: str | None) -> None:
+            for s in body_stmts(body):
+                if isinstance(s, Tile):
+                    visit(s.body, self._lane_axis_for_tile(s))
+                elif isinstance(s, Loop):
+                    if lane_axis and self._is_warp_uniform_dot_reduce(s, lane_axis):
+                        self.warp_reduce_loops[id(s)] = lane_axis
+                    else:
+                        visit(s.body, lane_axis)
+                elif isinstance(s, Cond):
+                    visit(s.body, lane_axis)
+                    visit(s.else_body, lane_axis)
+                elif isinstance(s, StridedLoop):
+                    visit(s.body, lane_axis)
+
+        visit(self.kop.body, None)
+
+    def _emit_warp_reduce_loop(self, loop: Loop, body) -> None:
+        """Lower a Loop flagged by _plan_warp_reduce_loops: bind the
+        loop's own axis variable directly to this lane's hardware lane
+        id (the Tile axis register that _lane_axis_for_tile proved
+        equals gid % 32 here), run the body ONCE so each lane computes
+        its own single term, then fold the 32 per-lane partials
+        together with the standard 5-step shfl.sync.bfly butterfly
+        (same instruction shape as emit_warpshuffle) so every lane ends
+        up holding the full sum - identical result to the 32-iteration
+        serial loop it replaces, in log2(32) shuffles instead of 32
+        redundant iterations per lane."""
+        e = self.e
+        lane_axis = self.warp_reduce_loops[id(loop)]
+        var = loop.axis.name
+        e.bind(var, e.env[lane_axis], "s32")
+        self.stmts(body)
+        accum = next(s for s in body_stmts(body) if isinstance(s, Accum))
+        reg = e.env[accum.name]
+        mask = e.new_r()
+        e.emit(f"        activemask.b32  {mask};")
+        step = 16
+        while step > 0:
+            bits = e.new_r()
+            e.emit(f"        mov.b32         {bits}, {reg};")
+            e.emit(f"        shfl.sync.bfly.b32 {bits}, {bits}, {step}, 31, {mask};")
+            shuf = e.new_f()
+            e.emit(f"        mov.b32         {shuf}, {bits};")
+            nxt = e.new_f()
+            e.emit(f"        add.f32         {nxt}, {reg}, {shuf};")
+            reg = nxt
+            step >>= 1
+        e.bind(accum.name, reg, "f32")
 
     @staticmethod
     def _pack_smem(smems: list[Smem]) -> tuple[dict[str, int], int]:
@@ -462,6 +825,8 @@ class Compiler:
         smems = collect_smem(self.kop.body)
         self.smem_offsets, self.smem_total = self._pack_smem(smems)
         self.use_dynamic_smem = self.smem_total > SMEM_STATIC_LIMIT
+        self._plan_buffer_cache()
+        self._plan_warp_reduce_loops()
         self.ptx_target = "sm_90" if self._uses_sm90() else PTX_TARGET
         e.emit(f".version {PTX_VERSION}")
         e.emit(f".target {self.ptx_target}")
@@ -478,14 +843,22 @@ class Compiler:
                 nb = nbytes_of("f32" if sm.dtype in ("float", "float32", "") else sm.dtype)
                 align = max(int(sm.align or 0), 4)
                 e.emit(f".shared .align {align} .b8 {sm.name}[{total * nb}];")
-            if smems:
+            for buf, shape in self.cached_buf.items():
+                total = 1
+                for d in shape:
+                    total *= d
+                nb = nbytes_of(self.dtypes.get(buf, "f32"))
+                e.emit(f".shared .align 16 .b8 _cache_{buf}[{total * nb}];")
+            if smems or self.cached_buf:
                 e.emit("")
         param_names = list(self.args)
         for name in self._tma_desc_names():
             if name not in param_names:
                 param_names.append(name)
             self.tma_descs.add(name)
-        params = ",\n".join(f"        .param .u64 param_{name}" for name in param_names)
+        params = ",\n".join(
+            f"        .param .{self._param_ty(name)} param_{name}" for name in param_names
+        )
         e.emit(f".visible .entry {self.kop.name}(")
         e.emit(params)
         e.emit(")")
@@ -501,12 +874,16 @@ class Compiler:
         decls = [
             f"        .reg .pred      %p<{max(self.e.np, 2)}>;",
             f"        .reg .f32       %f<{max(self.e.nf, 2)}>;",
-            f"        .reg .f64       %fd<{max(self.e.nd, 2)}>;",
+        ]
+        if self.e.nd > 1:
+            decls.append(f"        .reg .f64       %fd<{self.e.nd}>;")
+        decls += [
             f"        .reg .b32       %r<{max(self.e.nr, 2)}>;",
             f"        .reg .b64       %rd<{max(self.e.nrd, 2)}>;",
             "",
         ]
         e.lines[body_at:body_at] = decls
+        # Do not emit .maxnreg: ptxas already packs (a01: 48 regs without it, 64 with .maxnreg 168).
         return "\n".join(e.lines) + "\n"
 
     def _launch_block(self) -> int | None:
@@ -527,7 +904,28 @@ class Compiler:
             vals = [int(x) for x in list(block) + [1, 1]][:3]
             return ", ".join(str(v) for v in vals)
         bt = self._launch_block()
+        # 1-warp .reqntid makes ptxas spend 80 regs on ILP (a02). Occupancy
+        # is already block-limited, so skip the clause and let it pack.
+        if bt == 32:
+            return None
         return str(bt) if bt else None
+
+    def _is_scalar(self, name: str) -> bool:
+        for arg in self.meta.get("args") or []:
+            if arg.get("name") == name and arg.get("scalar"):
+                return True
+        return False
+
+    def _param_ty(self, name: str) -> str:
+        if self._is_scalar(name):
+            dt = self.dtypes.get(name, "f32")
+            return ptx_type(dt)
+        return "u64"
+
+    def _load_op(self, space: str, pty: str, buf: str, vec: int = 1) -> str:
+        cache = ".nc" if space == "global" and buf not in self.written else ""
+        v = f".v{vec}" if vec > 1 else ""
+        return f"ld.{space}{cache}{v}.{pty}"
 
     def _uses_sm90(self) -> bool:
         hopper = (
@@ -539,17 +937,43 @@ class Compiler:
     def _tma_desc_names(self) -> list[str]:
         return [s.name for s in walk_stmts(self.kop.body) if isinstance(s, TmaDescriptor)]
 
+    def _dim3(self, key: str) -> list[int]:
+        v = self.meta.get(key) or [1, 1, 1]
+        vals = [int(x) for x in list(v) + [1, 1]][:3]
+        return vals
+
+    def _launch_1d(self) -> bool:
+        return all(x == 1 for x in self._dim3("block")[1:]) and all(x == 1 for x in self._dim3("grid")[1:])
+
+    def _needs_lane(self) -> bool:
+        return any(isinstance(s, (WarpShuffle, TreeHalve, LdmatrixLoad, MmaSyncPtx, RegStore)) for s in walk_stmts(self.kop.body))
+
     def prologue(self) -> None:
         e = self.e
         for name in self.args:
+            if self._is_scalar(name):
+                dt = self.dtypes.get(name, "f32")
+                pty = ptx_type(dt)
+                if dt in ("f32", "float", "float32"):
+                    r = e.new_f()
+                    e.emit(f"        ld.param.f32    {r}, [param_{name}];")
+                    e.bind(name, r, "f32")
+                elif dt in ("f64", "double"):
+                    r = e.new_d()
+                    e.emit(f"        ld.param.f64    {r}, [param_{name}];")
+                    e.bind(name, r, "f64")
+                else:
+                    r = e.new_r()
+                    e.emit(f"        ld.param.{pty}    {r}, [param_{name}];")
+                    e.bind(name, r, "s32")
+                continue
             raw = e.new_rd()
-            ptr = e.new_rd()
             e.emit(f"        ld.param.u64    {raw}, [param_{name}];")
             if name in self.smem:
-                e.emit(f"        cvta.to.shared.u64     {ptr}, {raw};")
+                e.emit(f"        cvta.to.shared.u64     {raw}, {raw};")
             else:
-                e.emit(f"        cvta.to.global.u64     {ptr}, {raw};")
-            self.ptrs[name] = ptr
+                e.emit(f"        cvta.to.global.u64     {raw}, {raw};")
+            self.ptrs[name] = raw
         if self.use_dynamic_smem and self.smem:
             pool = e.new_r()
             e.emit(f"        mov.u32         {pool}, _emmy_smem;")
@@ -567,64 +991,90 @@ class Compiler:
                 e.emit(f"        mov.u32         {base32}, {sm.name};")
                 self.smem_base[sm.name] = base32
         tid = e.new_r()
-        tidy = e.new_r()
-        tidz = e.new_r()
         ntid = e.new_r()
-        ntidy = e.new_r()
-        ntidz = e.new_r()
-        nctay = e.new_r()
-        nctax = e.new_r()
         cta = e.new_r()
-        ctay = e.new_r()
-        ctaz = e.new_r()
-        tlin = e.new_r()
-        clin = e.new_r()
-        nprod = e.new_r()
         gid = e.new_r()
         e.emit(f"        mov.u32         {tid}, %tid.x;")
-        e.emit(f"        mov.u32         {tidy}, %tid.y;")
-        e.emit(f"        mov.u32         {tidz}, %tid.z;")
         e.emit(f"        mov.u32         {ntid}, %ntid.x;")
-        e.emit(f"        mov.u32         {ntidy}, %ntid.y;")
-        e.emit(f"        mov.u32         {ntidz}, %ntid.z;")
         e.emit(f"        mov.u32         {cta}, %ctaid.x;")
-        e.emit(f"        mov.u32         {ctay}, %ctaid.y;")
-        e.emit(f"        mov.u32         {ctaz}, %ctaid.z;")
-        e.emit(f"        mov.u32         {nctax}, %nctaid.x;")
-        e.emit(f"        mov.u32         {nctay}, %nctaid.y;")
-        # linear tid = ((z * ntid.y + y) * ntid.x + x)
-        # linear cta = ((z * nctaid.y + y) * nctaid.x + x) — not ntid
-        tmp = e.new_r()
-        e.emit(f"        mad.lo.s32      {tmp}, {tidz}, {ntidy}, {tidy};")
-        e.emit(f"        mad.lo.s32      {tlin}, {tmp}, {ntid}, {tid};")
-        e.emit(f"        mad.lo.s32      {tmp}, {ctaz}, {nctay}, {ctay};")
-        e.emit(f"        mad.lo.s32      {clin}, {tmp}, {nctax}, {cta};")
-        e.emit(f"        mul.lo.s32      {tmp}, {ntid}, {ntidy};")
-        e.emit(f"        mul.lo.s32      {nprod}, {tmp}, {ntidz};")
-        e.emit(f"        mad.lo.s32      {gid}, {clin}, {nprod}, {tlin};")
+        if self._launch_1d():
+            e.emit(f"        mad.lo.s32      {gid}, {cta}, {ntid}, {tid};")
+            ncta = e.new_r()
+            e.emit(f"        mov.u32         {ncta}, %nctaid.x;")
+            tlin, nprod, clin = tid, ntid, cta
+            z = e.imm_s32(0)
+            one = e.imm_s32(1)
+            e.bind("threadIdx.y", z, "s32")
+            e.bind("threadIdx.z", z, "s32")
+            e.bind("blockDim.y", one, "s32")
+            e.bind("blockDim.z", one, "s32")
+            e.bind("blockIdx.y", z, "s32")
+            e.bind("blockIdx.z", z, "s32")
+        else:
+            tidy = e.new_r()
+            tidz = e.new_r()
+            ntidy = e.new_r()
+            ntidz = e.new_r()
+            nctax = e.new_r()
+            nctay = e.new_r()
+            ctay = e.new_r()
+            ctaz = e.new_r()
+            tlin = e.new_r()
+            clin = e.new_r()
+            nprod = e.new_r()
+            e.emit(f"        mov.u32         {tidy}, %tid.y;")
+            e.emit(f"        mov.u32         {tidz}, %tid.z;")
+            e.emit(f"        mov.u32         {ntidy}, %ntid.y;")
+            e.emit(f"        mov.u32         {ntidz}, %ntid.z;")
+            e.emit(f"        mov.u32         {ctay}, %ctaid.y;")
+            e.emit(f"        mov.u32         {ctaz}, %ctaid.z;")
+            e.emit(f"        mov.u32         {nctax}, %nctaid.x;")
+            e.emit(f"        mov.u32         {nctay}, %nctaid.y;")
+            tmp = e.new_r()
+            e.emit(f"        mad.lo.s32      {tmp}, {tidz}, {ntidy}, {tidy};")
+            e.emit(f"        mad.lo.s32      {tlin}, {tmp}, {ntid}, {tid};")
+            e.emit(f"        mad.lo.s32      {tmp}, {ctaz}, {nctay}, {ctay};")
+            e.emit(f"        mad.lo.s32      {clin}, {tmp}, {nctax}, {cta};")
+            e.emit(f"        mul.lo.s32      {tmp}, {ntid}, {ntidy};")
+            e.emit(f"        mul.lo.s32      {nprod}, {tmp}, {ntidz};")
+            e.emit(f"        mad.lo.s32      {gid}, {clin}, {nprod}, {tlin};")
+            nctaz = e.new_r()
+            ncta = e.new_r()
+            e.emit(f"        mov.u32         {nctaz}, %nctaid.z;")
+            e.emit(f"        mul.lo.s32      {ncta}, {nctax}, {nctay};")
+            e.emit(f"        mul.lo.s32      {ncta}, {ncta}, {nctaz};")
+            e.bind("threadIdx.y", tidy, "s32")
+            e.bind("threadIdx.z", tidz, "s32")
+            e.bind("blockDim.y", ntidy, "s32")
+            e.bind("blockDim.z", ntidz, "s32")
+            e.bind("blockIdx.y", ctay, "s32")
+            e.bind("blockIdx.z", ctaz, "s32")
         e.bind("_tid", tlin, "s32")
         e.bind("_ntid", nprod, "s32")
         e.bind("_cta", clin, "s32")
+        e.bind("_ncta", ncta, "s32")
         e.bind("_gid", gid, "s32")
         e.bind("threadIdx.x", tid, "s32")
-        e.bind("threadIdx.y", tidy, "s32")
-        e.bind("threadIdx.z", tidz, "s32")
         e.bind("blockDim.x", ntid, "s32")
-        e.bind("blockDim.y", ntidy, "s32")
-        e.bind("blockDim.z", ntidz, "s32")
         e.bind("blockIdx.x", cta, "s32")
-        e.bind("blockIdx.y", ctay, "s32")
-        e.bind("blockIdx.z", ctaz, "s32")
         for name in self.tma_descs:
             raw = e.new_rd()
             e.emit(f"        ld.param.u64    {raw}, [param_{name}];")
             self.ptrs[name] = raw
-        lane = e.new_r()
-        warp = e.new_r()
-        e.emit(f"        and.b32         {lane}, {tid}, 31;")
-        e.emit(f"        shr.u32         {warp}, {tid}, 5;")
-        e.bind("lane", lane, "s32")
-        e.bind("warp", warp, "s32")
+        if self._needs_lane():
+            # Lane/warp must come from the linearized LOCAL thread index
+            # (tlin), not raw %tid.x: CUDA packs threads into warps of 32
+            # by threadIdx.z*ntid.y*ntid.x + threadIdx.y*ntid.x + threadIdx.x.
+            # tlin == tid for every 1D launch (the baseline + reduction/
+            # matmul/attention kernels), so this changes nothing there; it
+            # only matters for multi-row tensor-core blocks (ntid.y/z > 1).
+            lane = e.new_r()
+            warp = e.new_r()
+            e.emit(f"        and.b32         {lane}, {tlin}, 31;")
+            e.emit(f"        shr.u32         {warp}, {tlin}, 5;")
+            e.bind("lane", lane, "s32")
+            e.bind("warp", warp, "s32")
+        self._emit_buffer_cache()
 
     def invalidate(self, name: str) -> None:
         pat = re.compile(rf"(^|[^A-Za-z0-9_]){re.escape(name)}([^A-Za-z0-9_]|$)")
@@ -633,11 +1083,11 @@ class Compiler:
         if self.mem:
             self.mem = {k: v for k, v in self.mem.items() if not pat.search(k)}
 
-    def _push_flow(self) -> tuple[dict, dict]:
-        return dict(self.cse), dict(self.mem)
+    def _push_flow(self) -> tuple[dict, dict, dict, dict]:
+        return dict(self.cse), dict(self.mem), dict(self.arith), dict(self.addr_cse)
 
-    def _pop_flow(self, saved: tuple[dict, dict]) -> None:
-        self.cse, self.mem = saved
+    def _pop_flow(self, saved: tuple[dict, dict, dict, dict]) -> None:
+        self.cse, self.mem, self.arith, self.addr_cse = saved
 
     def _kill_mem(self, buf: str) -> None:
         prefix = buf + "["
@@ -667,6 +1117,9 @@ class Compiler:
             if isinstance(s, Load) and self._try_vec_load(s, sl[i + 1 :], done):
                 i += 1
                 continue
+            if isinstance(s, Write) and self._try_vec_store(s, sl[i + 1 :], done):
+                i += 1
+                continue
             if self._try_fma(s, nxt, sl[i + 2 :]):
                 i += 2
                 continue
@@ -686,19 +1139,20 @@ class Compiler:
         la, lb = lit_int(a), lit_int(b)
         if la is not None and lb is not None:
             return lb == la + 1
-        if isinstance(b, BinaryExpr) and b.op == "+" and lit_int(b.right) == 1 and b.left.pretty() == a.pretty():
-            return True
-        if (
-            isinstance(a, BinaryExpr)
-            and a.op == "+"
-            and lit_int(a.right) == 0
-            and isinstance(b, BinaryExpr)
-            and b.op == "+"
-            and lit_int(b.right) == 1
-            and a.left.pretty() == b.left.pretty()
-        ):
-            return True
-        return False
+
+        def base_off(e):
+            # `base + k` for a literal k decomposes to (base text, k); a
+            # bare expression (no "+ literal" at the top) is its own base
+            # at offset 0. This makes x[k] vs x[k+1] match for ANY k, not
+            # just k == 0 — the IR emits "(idx + 2)", "(idx + 3)", ... for
+            # every unrolled copy, not only the first pair.
+            if isinstance(e, BinaryExpr) and e.op == "+" and lit_int(e.right) is not None:
+                return e.left.pretty(), lit_int(e.right)
+            return e.pretty(), 0
+
+        base_a, off_a = base_off(a)
+        base_b, off_b = base_off(b)
+        return base_a == base_b and off_b == off_a + 1
 
     def _try_vec_load(self, s: Load, rest, done: set[int]) -> bool:
         if len(list(s.names)) != 1:
@@ -730,7 +1184,7 @@ class Compiler:
         if vec == 0:
             return False
         chain = chain[:vec]
-        space = "shared" if s.input in self.smem else "global"
+        space = "shared" if s.input in self.smem or s.input in self.cached_buf else "global"
         addr = self.addr_of(s.input, s.index, space)
         regs = [self.e.new_f() for _ in chain]
         packed = ", ".join(regs)
@@ -738,7 +1192,7 @@ class Compiler:
             z = self.e.imm_f32(0.0)
             for r in regs:
                 self.e.emit(f"        mov.f32         {r}, {z};")
-        self.e.emit(f"{self._at(space)}ld.{space}.v{vec}.f32 {{{packed}}}, [{addr}];")
+        self.e.emit(f"{self._at(space)}{self._load_op(space, 'f32', s.input, vec)} {{{packed}}}, [{addr}];")
         for load, reg in zip(chain, regs):
             name = list(load.names)[0]
             self.e.bind(name, reg, "f32")
@@ -746,6 +1200,53 @@ class Compiler:
             self.mem[f"{load.input}[{idx}]|1"] = (reg,)
             done.add(id(load))
         self.stats["vec_loads"] += 1
+        return True
+
+    def _try_vec_store(self, s: Write, rest, done: set[int]) -> bool:
+        if s.atomic or len(list(s.values)) != 1:
+            return False
+        dt = dtype_name(s.value_dtype) or self.dtypes.get(s.output, "f32")
+        if dt not in ("f32", "float", "float32"):
+            return False
+        if s.output in self.smem:
+            return False
+        chain = [s]
+        last = s
+        # A value-producing Assign/Accum between two Writes (e.g. the
+        # reciprocal+multiply that rescales each attention output column)
+        # must not block vectorizing those Writes: run it now so the next
+        # Write's value is bound, then keep scanning for the vector match.
+        pending: list = []
+        for t in rest:
+            if isinstance(t, (Assign, Accum)) and id(t) not in done:
+                pending.append(t)
+                continue
+            if not isinstance(t, Write) or t.atomic or t.output != s.output:
+                break
+            if len(list(t.values)) != 1:
+                break
+            if not self._consecutive_index(last.index, t.index):
+                break
+            for p in pending:
+                self.stmt(p)
+                done.add(id(p))
+            pending = []
+            chain.append(t)
+            last = t
+            if len(chain) == 4:
+                break
+        vec = 4 if len(chain) >= 4 else 2 if len(chain) >= 2 else 0
+        if vec == 0:
+            return False
+        chain = chain[:vec]
+        addr = self.addr_of(s.output, s.index, "global")
+        regs = [self.as_f32(list(w.values)[0]) for w in chain]
+        packed = ", ".join(regs)
+        self.e.emit(f"{self._at('global')}st.global.v{vec}.f32 [{addr}], {{{packed}}};")
+        for w in chain:
+            done.add(id(w))
+        self._kill_mem(s.output)
+        self.stats["vec_stores"] = self.stats.get("vec_stores", 0) + 1
         return True
 
     def _can_fuse_loops(self, a, b) -> bool:
@@ -824,15 +1325,92 @@ class Compiler:
                 return False
         return True
 
+    def _body_touches_global(self, body) -> bool:
+        for s in walk_stmts(body):
+            if isinstance(s, Load) and s.input not in self.smem and s.input not in self.cached_buf:
+                return True
+            if isinstance(s, Write) and s.output not in self.smem:
+                return True
+            if isinstance(s, (CpAsyncCopy, TmaLoad, RegStore)):
+                return True
+        return False
+
+    def _body_global_bufs(self, body) -> set[str]:
+        bufs: set[str] = set()
+        for s in walk_stmts(body):
+            if isinstance(s, Load) and s.input not in self.smem and s.input not in self.cached_buf:
+                bufs.add(s.input)
+            if isinstance(s, Write) and s.output not in self.smem:
+                bufs.add(s.output)
+        return bufs
+
     def _should_unroll(self, loop, end: int, body) -> bool:
+        # Measured on 64 compilers: full-unroll of global bodies blows
+        # attention (a02: 80 regs vs 48). Full-unroll of smem bodies is how
+        # the fastest matmul entries get their FMA count.
         if end <= 0 or self._has_nested_loop(body):
+            return False
+        if not self._body_is_straight(body):
             return False
         ops = max(self._stmt_count(body), 1)
         if ops * end > UNROLL_EXPANSION_CAP:
             return False
-        if getattr(loop, "unroll", False):
-            return True
-        return self._body_is_straight(body)
+        if self._body_touches_global(body):
+            # A loop with a SINGLE remaining global buffer (the rest
+            # already cached in shared memory, e.g. attention's Q once K
+            # is staged) only keeps one live address register per
+            # unrolled copy - the register blow-up that made wide global
+            # unrolling a loss (measured: a02 at 80 regs) came from many
+            # DISTINCT buffers needing independent address arithmetic
+            # live at once, not from unrolling itself. Measured on the
+            # real GPU runner: unrolling a02's 32-trip inner loop once Q
+            # is the only global read left is faster (22us vs 37us), not
+            # a register/occupancy regression.
+            if len(self._body_global_bufs(body)) <= 1:
+                return end <= 32
+            return end <= 4
+        return end <= 64
+
+    def _partial_factor(self, end: int, body) -> int:
+        # Global partial-unroll of a body with NO nested loop kept a02 at
+        # 80 regs (8 live addr pairs) before the warp-reduce pass existed -
+        # occupancy from a rolled inner product beat the extra ILP, so this
+        # used to unconditionally return 1. First attempt at reviving it
+        # after the warp-reduce pass shrank a02's body (30 vs 24 regs
+        # looked promising) silently corrupted results (max abs err ~3.9 on
+        # the real GPU, not ~1e-7): emit_loop's factor>1 path calls
+        # self.stmts(body) more than once per *Python* codegen pass while
+        # the result still lives inside ONE physical PTX loop, which
+        # re-enters any nested reduce Loop's own emit_loop/seed_accums more
+        # than once - seed_accums's "already bound -> don't reseed" guard
+        # (correct for the OUTER carried softmax state, which must persist
+        # across real loop trips) then also wrongly skipped reseeding the
+        # INNER reduction's own accumulator between copies. Fixed via
+        # `_reseed_nested_accums` (emit_loop explicitly un-binds the
+        # nested accumulator between copies so it genuinely restarts), but
+        # kept this factor narrowly gated: only a nested loop already
+        # proven lane-independent and reseed-safe by the warp-reduce pass
+        # (`self.warp_reduce_loops`) is eligible, with at most 2 live
+        # global buffers per copy (mirrors _should_unroll's own measured
+        # global-unroll gate) and `end` dividing evenly so there is no
+        # ragged tail to special-case. Measured on the real GPU runner:
+        # factor=8 here (a02's 128-trip outer loop) got the numerics right
+        # (err ~1e-7) and took a02 from 38us to ~25us post-warp-reduce,
+        # then ~20-22us with address reuse. Byte-identical PTX
+        # on every other open kernel - none of their nested loops are in
+        # `self.warp_reduce_loops`, so this stays a no-op for them.
+        if not self._has_nested_loop(body):
+            return 1
+        nested = [s for s in body_stmts(body) if isinstance(s, Loop)]
+        if len(nested) != 1 or id(nested[0]) not in self.warp_reduce_loops:
+            return 1
+        if len(self._body_global_bufs(body)) > 2:
+            return 1
+        ops = max(self._stmt_count(body), 1)
+        for factor in (8, 4, 2):
+            if end % factor == 0 and ops * factor <= UNROLL_EXPANSION_CAP:
+                return factor
+        return 1
 
     def _uses_name(self, stmt, name: str) -> bool:
         if hasattr(stmt, "deps") and name in stmt.deps():
@@ -887,6 +1465,12 @@ class Compiler:
             self.e.emit(f"        cp.async.wait_group {int(s.group)};")
         elif isinstance(s, Select):
             self.emit_select(s)
+        elif isinstance(s, Pre):
+            self.emit_pre(s)
+        elif isinstance(s, Carry):
+            self.emit_carry(s)
+        elif isinstance(s, ZeroPrologue):
+            self.emit_zero_prologue(s)
         elif isinstance(s, TmaDescriptor):
             return
         elif isinstance(s, TmaLoad):
@@ -988,7 +1572,7 @@ class Compiler:
                 if ni == mi + 1:
                     gi, oi = (mi, ni) if tile.raster_orient == "m" else (ni, mi)
                     g_eff = min(int(tile.raster_group), extents[gi])
-                    if extents[gi] > 1 and g_eff > 1:
+                    if extents[gi] > 1 and extents[oi] > 1 and g_eff > 1:
                         raster = (gi, oi, g_eff, mi, ni)
         decls_done = False
         a_reg = b_reg = None
@@ -1029,6 +1613,9 @@ class Compiler:
                 if i == ni:
                     e.bind(axis.name, a_reg if i == gi else b_reg, "s32")
                     continue
+            if ext == 1:
+                e.bind(axis.name, "0", "s32")
+                continue
             term = gid if s == 1 else self.div_imm(gid, s)
             if i == 0:
                 e.bind(axis.name, term, "s32")
@@ -1041,6 +1628,15 @@ class Compiler:
             if saved is not None:
                 self._pop_flow(saved)
 
+    def _arith(self, key: str, emit) -> str:
+        hit = self.arith.get(key)
+        if hit is not None:
+            self.stats["cse_hits"] += 1
+            return hit
+        val = emit()
+        self.arith[key] = val
+        return val
+
     def mul_imm(self, src: str, imm: int) -> str:
         si = parse_imm(src)
         if si is not None:
@@ -1050,9 +1646,15 @@ class Compiler:
         if imm == 1:
             return src
         if imm == -1:
-            d = self.e.new_r()
-            self.e.emit(f"        neg.s32         {d}, {src};")
-            return d
+            return self._arith(f"neg:{src}", lambda: self._neg_s32(src))
+        return self._arith(f"{src}*{imm}", lambda: self._mul_imm_emit(src, imm))
+
+    def _neg_s32(self, src: str) -> str:
+        d = self.e.new_r()
+        self.e.emit(f"        neg.s32         {d}, {src};")
+        return d
+
+    def _mul_imm_emit(self, src: str, imm: int) -> str:
         d = self.e.new_r()
         if is_pow2(abs(imm)):
             self.e.emit(f"        shl.b32         {d}, {src}, {ilog2(abs(imm))};")
@@ -1070,6 +1672,9 @@ class Compiler:
             return str(si // imm)
         if imm == 1:
             return src
+        return self._arith(f"{src}/{imm}", lambda: self._div_imm_emit(src, imm))
+
+    def _div_imm_emit(self, src: str, imm: int) -> str:
         d = self.e.new_r()
         if is_pow2(imm):
             self.e.emit(f"        shr.u32         {d}, {src}, {ilog2(imm)};")
@@ -1081,6 +1686,11 @@ class Compiler:
         si = parse_imm(src)
         if si is not None and imm:
             return str(si % imm)
+        if imm == 1:
+            return "0"
+        return self._arith(f"{src}%{imm}", lambda: self._rem_imm_emit(src, imm))
+
+    def _rem_imm_emit(self, src: str, imm: int) -> str:
         d = self.e.new_r()
         if is_pow2(imm):
             self.e.emit(f"        and.b32         {d}, {src}, {imm - 1};")
@@ -1128,6 +1738,9 @@ class Compiler:
             return self.mul_imm(a, imm)
         if imm == 1:
             return self.add_s32(a, c)
+        return self._arith(f"{a}*{imm}+{c}", lambda: self._mad_imm_emit(a, imm, c))
+
+    def _mad_imm_emit(self, a: str, imm: int, c: str) -> str:
         d = self.e.new_r()
         self.e.emit(f"        mad.lo.s32      {d}, {a}, {imm}, {c};")
         return d
@@ -1140,6 +1753,10 @@ class Compiler:
             return b
         if ib == 0:
             return a
+        key = f"{a}+{b}" if str(a) <= str(b) else f"{b}+{a}"
+        return self._arith(key, lambda: self._add_s32_emit(a, b, ia, ib))
+
+    def _add_s32_emit(self, a: str, b: str, ia, ib) -> str:
         d = self.e.new_r()
         if ib is not None:
             self.e.emit(f"        add.s32         {d}, {a}, {ib};")
@@ -1165,6 +1782,34 @@ class Compiler:
                 else:
                     self.e.bind(s.name, self.e.imm_s32(int(ident)), "s32")
 
+    def _reseed_nested_accums(self, body) -> list[str]:
+        """Names of Accum statements that live directly inside a nested
+        Loop/StridedLoop marked `seed=True` one level under `body`
+        (body -> inner.body -> Accum). `emit_loop`'s factor>1 path (see
+        `_partial_factor`) calls `self.stmts(body)` more than once per
+        *Python* codegen pass while the result still lives inside ONE
+        physical PTX loop; each of those calls re-enters the nested
+        Loop's own `emit_loop`, which re-runs `seed_accums` - but that
+        guard is "skip if already bound", which is correct for an OUTER
+        accumulator that must persist across real loop trips (seeded
+        once, before this factor-loop even starts, by the ordinary
+        `self.seed_accums(body, ...)` call above - that call only reads
+        body's own top-level statements, so it's untouched by this), and
+        WRONG for an inner reduction that must restart at its identity
+        value on every one of these replicated copies. Used by
+        `emit_loop` to explicitly un-bind those names between copies so
+        the next one reseeds for real instead of inheriting the
+        previous copy's final sum (the exact bug that made an earlier
+        attempt at this measure ~3.9 max-abs-err on the real GPU - see
+        the comment on `_partial_factor`)."""
+        names: list[str] = []
+        for s in body_stmts(body):
+            if isinstance(s, (Loop, StridedLoop)) and getattr(s, "seed", False):
+                for inner in body_stmts(s.body):
+                    if isinstance(inner, Accum) and inner.name not in names:
+                        names.append(inner.name)
+        return names
+
     def emit_loop(self, loop: Loop, body_override=None, seed_any: bool = False) -> None:
         e = self.e
         body = body_override if body_override is not None else loop.body
@@ -1173,19 +1818,45 @@ class Compiler:
         end = axis_extent(loop.axis)
         if end <= 0:
             return
+        if body_override is None and id(loop) in self.warp_reduce_loops:
+            self._emit_warp_reduce_loop(loop, body)
+            return
         if self._should_unroll(loop, end, body):
             self.stats["unrolled_iters"] += end
             for k in range(end):
                 e.bind(var, str(k), "s32")
                 self.stmts(body)
             return
+        factor = self._partial_factor(end, body)
         i = e.mov_s32(0)
-        e.bind(var, i, "s32")
         saved = self._push_flow()
         head = e.label("LOOP")
+        if self._body_touches_global(body):
+            e.emit('        .pragma "nounroll";')
         e.emit(f"{head}:")
-        self.stmts(body)
-        e.emit(f"        add.s32         {i}, {i}, 1;")
+        if factor > 1:
+            self.stats["unrolled_iters"] += factor
+            reseed = self._reseed_nested_accums(body)
+            saved_subst = self._unroll_subst
+            for k in range(factor):
+                if k > 0:
+                    for name in reseed:
+                        e.env.pop(name, None)
+                        self.invalidate(name)
+                if k == 0:
+                    e.bind(var, i, "s32")
+                else:
+                    iv = e.new_r()
+                    e.emit(f"        add.s32         {iv}, {i}, {k};")
+                    e.bind(var, iv, "s32")
+                self._unroll_subst = (var, i, k)
+                self.stmts(body)
+            self._unroll_subst = saved_subst
+            e.emit(f"        add.s32         {i}, {i}, {factor};")
+        else:
+            e.bind(var, i, "s32")
+            self.stmts(body)
+            e.emit(f"        add.s32         {i}, {i}, 1;")
         self.invalidate(var)
         p = e.new_p()
         e.emit(f"        setp.lt.s32     {p}, {i}, {end};")
@@ -1229,6 +1900,8 @@ class Compiler:
         saved = self._push_flow()
         head = e.label("SLOOP")
         done = e.label("SLEND")
+        if self._body_touches_global(loop.body):
+            e.emit('        .pragma "nounroll";')
         e.emit(f"{head}:")
         p = e.new_p()
         e.emit(f"        setp.ge.s32     {p}, {i}, {end};")
@@ -1286,7 +1959,7 @@ class Compiler:
     def emit_load(self, s: Load) -> None:
         dt = dtype_name(s.dtype) or self.dtypes.get(s.input, "f32")
         pty = ptx_type(dt)
-        space = "shared" if s.input in self.smem else "global"
+        space = "shared" if s.input in self.smem or s.input in self.cached_buf else "global"
         names = list(s.names)
         n = len(names)
         vec = n if n in (2, 4) and dt in ("f32", "float", "float32") else 1
@@ -1305,7 +1978,7 @@ class Compiler:
                 z = self.e.imm_f32(0.0)
                 for r in regs:
                     self.e.emit(f"        mov.f32         {r}, {z};")
-            self.e.emit(f"{self._at(space)}ld.{space}.v{vec}.{pty} {{{packed}}}, [{addr}];")
+            self.e.emit(f"{self._at(space)}{self._load_op(space, pty, s.input, vec)} {{{packed}}}, [{addr}];")
             for name, reg in zip(names, regs):
                 self.e.bind(name, reg, "f32")
             self.mem[mem_key] = tuple(regs)
@@ -1322,32 +1995,32 @@ class Compiler:
                 reg = self.e.new_f()
                 if space == "global" and self.active:
                     self.e.emit(f"        mov.f32         {reg}, {self.e.imm_f32(0.0)};")
-                self.e.emit(f"{self._at(space)}ld.{space}.{pty}   {reg}, [{addr}];")
+                self.e.emit(f"{self._at(space)}{self._load_op(space, pty, s.input)}   {reg}, [{addr}];")
                 self.e.bind(name, reg, "f32")
                 regs_out.append(reg)
             elif dt in ("f16", "half"):
                 tmp = self.e.new_r()
                 dest = self.e.new_f()
-                self.e.emit(f"{self._at(space)}ld.{space}.f16    {tmp}, [{addr}];")
+                self.e.emit(f"{self._at(space)}{self._load_op(space, 'f16', s.input)}    {tmp}, [{addr}];")
                 self.e.emit(f"        cvt.f32.f16      {dest}, {tmp};")
                 self.e.bind(name, dest, "f32")
                 regs_out.append(dest)
             elif dt in ("bf16",):
                 tmp = self.e.new_r()
                 dest = self.e.new_f()
-                self.e.emit(f"{self._at(space)}ld.{space}.bf16   {tmp}, [{addr}];")
+                self.e.emit(f"{self._at(space)}{self._load_op(space, 'bf16', s.input)}   {tmp}, [{addr}];")
                 self.e.emit(f"        cvt.f32.bf16     {dest}, {tmp};")
                 self.e.bind(name, dest, "f32")
                 regs_out.append(dest)
             elif dt in ("f64", "double"):
                 dest = self.e.new_d()
-                self.e.emit(f"{self._at(space)}ld.{space}.f64    {dest}, [{addr}];")
+                self.e.emit(f"{self._at(space)}{self._load_op(space, 'f64', s.input)}    {dest}, [{addr}];")
                 self.e.bind(name, dest, "f64")
                 regs_out.append(dest)
             else:
                 kind = "s32"
                 reg = self.e.new_r()
-                self.e.emit(f"{self._at(space)}ld.{space}.{pty}   {reg}, [{addr}];")
+                self.e.emit(f"{self._at(space)}{self._load_op(space, pty, s.input)}   {reg}, [{addr}];")
                 self.e.bind(name, reg, "s32")
                 regs_out.append(reg)
         self.mem[mem_key] = tuple(regs_out)
@@ -1656,6 +2329,140 @@ class Compiler:
             return q.left
         return None
 
+    def _linear_terms(self, expr) -> tuple[dict, int] | None:
+        """Flatten a +/-/neg tree of index-arithmetic into {leaf: coeff} +
+        const, so `(base + off) - base` cancels instead of round-tripping
+        through registers. Never descends into `*`, `/`, casts, or
+        comparisons — those stay opaque leaves, so this cannot change
+        multiply/divide semantics. Returns None when nothing would change
+        (a single leaf, coeff 1, const 0) so the caller's normal path and
+        CSE keys are untouched for every expression this cannot help.
+        """
+        terms: dict[str, tuple[int, object]] = {}
+        const = 0
+
+        def walk(e, sign: int) -> bool:
+            nonlocal const
+            if isinstance(e, Literal) and not isinstance(e.value, bool):
+                if e.dtype in ("float", "f32") or isinstance(e.value, float) and e.value != int(e.value):
+                    return False
+                const += sign * int(e.value)
+                return True
+            if isinstance(e, BinaryExpr) and e.op == "+":
+                return walk(e.left, sign) and walk(e.right, sign)
+            if isinstance(e, BinaryExpr) and e.op == "-":
+                return walk(e.left, sign) and walk(e.right, -sign)
+            try:
+                key = e.pretty()
+            except Exception:
+                return False
+            coeff, _ = terms.get(key, (0, e))
+            terms[key] = (coeff + sign, e)
+            return True
+
+        if not (isinstance(expr, BinaryExpr) and expr.op in ("+", "-")):
+            return None
+        if not walk(expr, 1):
+            return None
+        live = {k: v for k, v in terms.items() if v[0] != 0}
+        if len(live) == 1 and const == 0 and next(iter(live.values()))[0] == 1:
+            return None
+        return live, const
+
+    def _index_s32(self, expr) -> str:
+        lin = self._linear_terms(expr)
+        if lin is None:
+            return self.expr_s32(expr)
+        terms, const = lin
+        acc = None
+        for coeff, rep in terms.values():
+            reg = self.expr_s32(rep)
+            term = self.mul_imm(reg, coeff)
+            acc = term if acc is None else self.add_s32(acc, term)
+        if acc is None:
+            return str(const)
+        return self.add_s32(acc, str(const)) if const else acc
+
+    def _as_var_times_const(self, expr, uvar: str) -> int | None:
+        """`int` if `expr` is exactly `Var(uvar)*CONST` or `CONST*Var(uvar)`,
+        else None. Used only to recognize the one extra multiplicative
+        shape `_linear_terms` deliberately leaves opaque (it never
+        descends into `*`), so this still can't change multiply/divide
+        semantics - it only ever *reads* a coefficient, never rewrites one."""
+        if isinstance(expr, BinaryExpr) and expr.op == "*":
+            li, ri = lit_int(expr.left), lit_int(expr.right)
+            if isinstance(expr.left, Var) and expr.left.name == uvar and ri is not None:
+                return ri
+            if isinstance(expr.right, Var) and expr.right.name == uvar and li is not None:
+                return li
+        return None
+
+    def _scalar_var_coeff(self, expr, uvar: str) -> int | None:
+        """Coefficient of `Var(uvar)` within one index dimension's
+        expression - 1 for a bare `Var(uvar)`, `coeff` for
+        `Var(uvar)*coeff` (or the reverse), the sum of such across a
+        +/- tree via `_linear_terms`, or 0 if `uvar` provably doesn't
+        appear at all. None means `uvar` appears somewhere this can't
+        prove a constant per-step stride for (e.g. inside a `*` with a
+        non-constant, or more than once with different multipliers) -
+        the caller (`_unroll_addr_coeff`) always treats None as "give
+        up, fall back to the ordinary full address recompute", never as
+        a 0."""
+        if isinstance(expr, Var):
+            return 1 if expr.name == uvar else 0
+        mult = self._as_var_times_const(expr, uvar)
+        if mult is not None:
+            return mult
+        lin = self._linear_terms(expr)
+        if lin is None:
+            return 0 if not self._expr_mentions(expr, uvar) else None
+        terms, _const = lin
+        found = 0
+        for coeff, rep in terms.values():
+            if isinstance(rep, Var) and rep.name == uvar:
+                found += coeff
+                continue
+            m = self._as_var_times_const(rep, uvar)
+            if m is not None:
+                found += coeff * m
+            elif self._expr_mentions(rep, uvar):
+                return None
+        return found
+
+    def _unroll_addr_coeff(self, buf: str, indices, uvar: str) -> int | None:
+        """Element-unit stride that incrementing `uvar` by 1 adds to
+        `buf`'s flattened index, mirroring `flatten`'s own row-major
+        (last-index-fastest) stride arithmetic but purely symbolically -
+        no registers, no code emitted - so `addr_of` can decide, before
+        computing anything, whether copy `k`'s address for this exact
+        buf+indices is simply copy 0's address plus `k*stride*nbytes`.
+        None (give up - safe, just means no shortcut) whenever `uvar`
+        appears in more than one index dimension, in a dimension with no
+        provable constant coefficient, or `buf`'s shape doesn't line up
+        with `indices` the same way `flatten` itself requires."""
+        if not indices:
+            return None
+        shape = self.shapes.get(buf)
+        if not (shape and len(shape) == len(indices)) and len(indices) != 1:
+            return None
+        total = None
+        for d, ix in enumerate(indices):
+            c = self._scalar_var_coeff(ix, uvar)
+            if c is None:
+                return None
+            if c == 0:
+                continue
+            if len(indices) == 1:
+                stride = 1
+            else:
+                stride = 1
+                for k in range(d + 1, len(shape)):
+                    stride *= int(shape[k])
+            if total is not None:
+                return None
+            total = c * stride
+        return total
+
     def flatten(self, buf: str, indices) -> str:
         if not indices:
             return "0"
@@ -1663,20 +2470,20 @@ class Compiler:
         if shape and len(indices) == 2 and len(shape) == 2:
             rec = self._divmod_recompose(indices[0], indices[1], int(shape[1]))
             if rec is not None:
-                return self.expr_s32(rec)
+                return self._index_s32(rec)
         if len(indices) == 1:
-            return self.expr_s32(indices[0])
+            return self._index_s32(indices[0])
         if not shape or len(shape) != len(indices):
-            acc = self.expr_s32(indices[0])
+            acc = self._index_s32(indices[0])
             for ix in indices[1:]:
-                acc = self.add_s32(acc, self.expr_s32(ix))
+                acc = self.add_s32(acc, self._index_s32(ix))
             return acc
         acc = None
         for d, ix in enumerate(indices):
             stride = 1
             for k in range(d + 1, len(shape)):
                 stride *= int(shape[k])
-            term = self.expr_s32(ix)
+            term = self._index_s32(ix)
             if acc is None:
                 acc = term if stride == 1 else self.mul_imm(term, stride)
             elif stride == 1:
@@ -1686,6 +2493,26 @@ class Compiler:
         return acc
 
     def addr_of(self, buf: str, indices, space: str) -> str:
+        subst = self._unroll_subst
+        if subst is not None:
+            uvar, k0_reg, k = subst
+            if k > 0:
+                coeff = self._unroll_addr_coeff(buf, indices, uvar)
+                if coeff:
+                    nb_elem = nbytes_of(self.dtypes.get(buf, "f32"))
+                    off = k * coeff * nb_elem
+                    saved_env = self.e.env.get(uvar)
+                    self.e.env[uvar] = k0_reg
+                    self._unroll_subst = None
+                    try:
+                        base_addr = self.addr_of(buf, indices, space)
+                    finally:
+                        self._unroll_subst = subst
+                        if saved_env is not None:
+                            self.e.env[uvar] = saved_env
+                        else:
+                            del self.e.env[uvar]
+                    return f"{base_addr}+{off}" if off else base_addr
         idx = self.flatten(buf, indices)
         nb = nbytes_of(self.dtypes.get(buf, "f32"))
         base = self.smem_base[buf] if space == "shared" else self.ptrs[buf]
@@ -1695,12 +2522,19 @@ class Compiler:
             if off == 0:
                 return base
             return f"{base} + {off}"
+        key = (space, base, idx, nb)
+        hit = self.addr_cse.get(key)
+        if hit is not None:
+            self.stats["cse_hits"] += 1
+            return hit
         if space == "shared":
             dst = self.e.new_r()
             self.e.emit(f"        mad.lo.s32      {dst}, {idx}, {nb}, {base};")
+            self.addr_cse[key] = dst
             return dst
         addr = self.e.new_rd()
         self.e.emit(f"        mad.wide.s32    {addr}, {idx}, {nb}, {base};")
+        self.addr_cse[key] = addr
         return addr
 
     def load_smem_elem(self, buf: str, idx_reg: str) -> str:
@@ -1713,8 +2547,7 @@ class Compiler:
             addr = base if off == 0 else f"{base} + {off}"
             self.e.emit(f"        ld.shared.f32   {dest}, [{addr}];")
             return dest
-        addr = self.e.new_r()
-        self.e.emit(f"        mad.lo.s32      {addr}, {idx_reg}, {nb}, {base};")
+        addr = self.mad_imm(idx_reg, nb, base)
         self.e.emit(f"        ld.shared.f32   {dest}, [{addr}];")
         return dest
 
@@ -1728,8 +2561,7 @@ class Compiler:
             addr = base if off == 0 else f"{base} + {off}"
             self.e.emit(f"        st.shared.f32   [{addr}], {src};")
             return
-        addr = self.e.new_r()
-        self.e.emit(f"        mad.lo.s32      {addr}, {idx_reg}, {nb}, {base};")
+        addr = self.mad_imm(idx_reg, nb, base)
         self.e.emit(f"        st.shared.f32   [{addr}], {src};")
 
     def as_f64(self, name: str) -> str:
@@ -1887,6 +2719,8 @@ class Compiler:
             return "f32", self.e.env[tmp]
         if isinstance(expr, BinaryExpr):
             return self.binary(expr)
+        if isinstance(expr, FlatIndex):
+            return "s32", self.flatten(expr.buffer, expr.index)
         print(f"unsupported expr {type(expr).__name__}", file=sys.stderr)
         raise SystemExit(2)
 
@@ -2022,6 +2856,61 @@ class Compiler:
             print(f"unsupported binop {op!r}", file=sys.stderr)
             raise SystemExit(2)
         return "s32", d
+
+    def _carry_slot(self, name: str, index) -> str:
+        if not index:
+            return "0"
+        imm = lit_int(index[0]) if len(index) == 1 else None
+        if imm is not None and all(lit_int(x) == 0 for x in index[1:]):
+            return str(imm)
+        return "_"
+
+    def emit_pre(self, s: Pre) -> None:
+        slot = self._carry_slot(s.carrier, s.index)
+        key = (s.carrier, slot)
+        if key in self.carry_vals:
+            src = self.carry_vals[key]
+        elif (s.carrier, "_") in self.carry_vals:
+            src = self.carry_vals[(s.carrier, "_")]
+        else:
+            src = self.e.imm_f32(float(self.carry_seed.get(s.carrier, 0.0)))
+        dest = self.e.new_f()
+        self.e.emit(f"        mov.f32         {dest}, {src};")
+        self.e.bind(s.name, dest, "f32")
+
+    def emit_carry(self, s: Carry) -> None:
+        self.carry_seed[s.name] = float(s.seed)
+        slot = self._carry_slot(s.name, s.index)
+        val = self.as_f32(s.value)
+        dest = self.e.new_f()
+        self.e.emit(f"        mov.f32         {dest}, {val};")
+        self.carry_vals[(s.name, slot)] = dest
+        self.e.bind(s.name, dest, "f32")
+
+    def emit_zero_prologue(self, s: ZeroPrologue) -> None:
+        words = int(s.words)
+        if words <= 0 or s.dst not in self.ptrs:
+            return
+        e = self.e
+        gid = e.env.get("_gid") or e.mov_s32(0)
+        ntid = e.env.get("_ntid") or e.mov_s32(1)
+        ncta = e.env.get("_ncta") or e.mov_s32(1)
+        stride = e.new_r()
+        e.emit(f"        mul.lo.s32      {stride}, {ntid}, {ncta};")
+        i = e.new_r()
+        e.emit(f"        mov.s32         {i}, {gid};")
+        head, done = e.label("ZPRO"), e.label("ZPEND")
+        e.emit(f"{head}:")
+        p = e.new_p()
+        e.emit(f"        setp.ge.s32     {p}, {i}, {words};")
+        e.emit(f"        @{p} bra        {done};")
+        addr = e.new_rd()
+        e.emit(f"        mad.wide.s32    {addr}, {i}, 4, {self.ptrs[s.dst]};")
+        e.emit(f"        st.global.u32   [{addr}], 0;")
+        e.emit(f"        add.s32         {i}, {i}, {stride};")
+        e.emit(f"        bra             {head};")
+        e.emit(f"{done}:")
+        self._kill_mem(s.dst)
 
     def emit_select(self, s: Select) -> None:
         dest = self.e.new_f()
